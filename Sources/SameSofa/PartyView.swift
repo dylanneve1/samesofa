@@ -87,14 +87,24 @@ struct PartyView: View {
                 Text(party.role == .host ? "Opening a room…" : "Finding your partner…").font(.title2)
             }
         case .waitingForPartner(let code):
-            WaitingForPartnerCard(code: code, filmName: party.filmName)
+            WaitingForPartnerCard(code: code, filmName: party.filmName, preparing: party.preparing) { model.leaveParty() }
         case .connecting:
             StatusCard {
                 ProgressView().controlSize(.large)
                 Text("Connecting…").font(.title2)
             }
         case .together:
-            if party.role == .guest && !playback.isLoaded {
+            if party.role == .host, let preparing = party.preparing {
+                StatusCard {
+                    PreparingView(preparing: preparing) { model.leaveParty() }
+                }
+            } else if party.role == .guest && !playback.isLoaded, let preparing = party.preparing {
+                StatusCard {
+                    Text("Your partner's Mac is preparing the film").font(.title2)
+                    ProgressView(value: preparing.fraction).frame(width: 260).tint(Theme.accent)
+                    Text("\(Int(preparing.fraction * 100))%").font(.callout.monospacedDigit()).foregroundStyle(Theme.secondaryText)
+                }
+            } else if party.role == .guest && !playback.isLoaded {
                 StatusCard {
                     Text("Getting the film ready").font(.title2)
                     ProgressView(value: party.transferFraction).frame(width: 260).tint(Theme.accent)
@@ -105,7 +115,7 @@ struct PartyView: View {
                     Text(playback.localBuffering ? "Catching up — the film is still arriving…" : "Waiting for your partner to catch up…")
                         .font(.title3)
                 }
-            } else if !playback.intendsToPlay && playback.position < 0.5 {
+            } else if !playback.intendsToPlay && playback.position < 0.5 && playback.isLoaded {
                 Button { playback.play() } label: {
                     Label("Play together", systemImage: "play.fill")
                         .font(.system(size: 22, weight: .semibold, design: .rounded))
@@ -139,7 +149,7 @@ struct PartyView: View {
                     .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(Capsule().fill(.black.opacity(0.45)))
             }
-            if party.phase == .together, party.role == .host, party.transferFraction < 1 {
+            if party.phase == .together, party.role == .host, party.preparing == nil, party.transferFraction < 1 {
                 Text("Sending the film: \(Int(party.transferFraction * 100))%")
                     .font(.callout).foregroundStyle(.white.opacity(0.75))
                     .padding(.horizontal, 12).padding(.vertical, 6)
@@ -153,7 +163,7 @@ struct PartyView: View {
     // MARK: Bottom controls
 
     private var controlBar: some View {
-        let enabled = party.phase == .together || party.role == .host
+        let enabled = (party.phase == .together || party.role == .host) && party.preparing == nil && playback.isLoaded
         return VStack(spacing: 10) {
             ScrubBar(position: scrubbing ?? playback.position, duration: playback.duration,
                      available: party.role == .guest ? party.transferFraction : 1) { value, ended in
@@ -181,6 +191,10 @@ struct PartyView: View {
                 VolumeControl(icon: "film", value: $party.filmVolume, help: "Film volume")
                 VolumeControl(icon: "person.wave.2", value: $party.voiceVolume, help: "Your partner's voice")
                 Divider().frame(height: 26).overlay(Color.white.opacity(0.2))
+                if playback.hasSubtitles {
+                    ToggleButton(on: playback.subtitlesOn, onIcon: "captions.bubble.fill", offIcon: "captions.bubble",
+                                 help: playback.subtitlesOn ? "Hide subtitles" : "Show subtitles") { playback.setSubtitles(!playback.subtitlesOn) }
+                }
                 ToggleButton(on: party.micOn, onIcon: "mic.fill", offIcon: "mic.slash.fill",
                              help: party.micOn ? "Mute your microphone" : "Unmute") { party.micOn.toggle() }
                 ToggleButton(on: party.cameraOn, onIcon: "video.fill", offIcon: "video.slash.fill",
@@ -340,9 +354,31 @@ struct VideoBubble: View {
     }
 }
 
+/// Host: the film is being converted to MP4 before it can be shared.
+struct PreparingView: View {
+    let preparing: Preparing
+    let cancel: () -> Void
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Text("Preparing film… \(Int(preparing.fraction * 100))%")
+                .font(.title2.monospacedDigit())
+            ProgressView(value: preparing.fraction).frame(width: 280).tint(Theme.accent)
+            Text(preparing.remuxOnly
+                 ? "Rewrapping it for macOS. No quality is lost."
+                 : "Converting it for macOS with this Mac's video encoder.")
+                .font(.callout).foregroundStyle(Theme.secondaryText)
+            Button(action: cancel) { Text("Cancel").frame(width: 120, height: 34) }
+                .buttonStyle(SoftButtonStyle()).padding(.top, 4)
+        }
+    }
+}
+
 struct WaitingForPartnerCard: View {
     let code: String
     let filmName: String?
+    var preparing: Preparing?
+    var cancel: () -> Void = {}
     @State private var copied = false
 
     var body: some View {
@@ -368,6 +404,10 @@ struct WaitingForPartnerCard: View {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
                 Text("Waiting for your partner…").foregroundStyle(Theme.secondaryText)
+            }
+            if let preparing {
+                Divider().overlay(Color.white.opacity(0.15)).frame(width: 300)
+                PreparingView(preparing: preparing, cancel: cancel)
             }
         }
         .padding(.horizontal, 54).padding(.vertical, 40)

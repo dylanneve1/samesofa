@@ -4,6 +4,16 @@ import Foundation
 import SameSofaCore
 import WebRTC
 
+/// Progress of turning the host's film into something both Macs can play.
+public struct Preparing: Equatable {
+    /// 0...1
+    public var fraction: Double
+    /// Only rewrapping (seconds) rather than re-encoding (minutes).
+    public var remuxOnly: Bool
+    /// Times real time, when known.
+    public var speed: Double?
+}
+
 public struct PartySettings {
     public var serverURL: URL
     public var ice: IceSettings
@@ -44,6 +54,9 @@ public final class Party: ObservableObject {
     @Published public private(set) var filmName: String?
     /// Guest: share of the film received. Host: what the guest reported.
     @Published public private(set) var transferFraction: Double = 0
+    /// Host: the film is being converted to MP4 before it can be shared.
+    /// Guest: the host said so. nil when nothing is being prepared.
+    @Published public private(set) var preparing: Preparing?
     @Published public private(set) var partnerCameraOn = true
     @Published public private(set) var partnerMicOn = true
     @Published public var micOn = true { didSet { call?.setMicMuted(!micOn); sendMediaState() } }
@@ -62,6 +75,10 @@ public final class Party: ObservableObject {
     private var control: ControlChannel?
     private var fileChannel: RTCDataChannel?
     private(set) var sender: FileSender?
+    private var preparer: FilmPreparer?
+    private var lastPreparingSent = Date.distantPast
+    /// Host: the file actually being sent (the original, or the converted MP4).
+    public var sharedFile: URL? { sender?.url }
     public private(set) var receiver: FileReceiver?
     private var clock = ClockSync()
     /// Best measured round trip to the partner, seconds (guest only).
@@ -83,15 +100,73 @@ public final class Party: ObservableObject {
 
     // MARK: Starting
 
-    /// Host: share `film` and open a room.
+    /// Host: share `film` as it is and open a room.
     public func host(film: URL) throws {
+        try host(film: film, check: .shareAsIs)
+    }
+
+    /// Host: open a room and share `film`, converting it first if `check`
+    /// says so. The room (and its code) opens straight away; the guest is
+    /// told about the film once the conversion has finished.
+    public func host(film: URL, check: FilmCheck) throws {
         precondition(role == .host)
-        let sender = try FileSender(url: film)
-        self.sender = sender
         filmName = film.deletingPathExtension().lastPathComponent
-        playback.load(asset: AVURLAsset(url: film))
+        switch check {
+        case .shareAsIs:
+            try startSharing(film, name: film.lastPathComponent)
+        case .convert(let plan, let tools):
+            guard FileManager.default.isReadableFile(atPath: film.path) else {
+                throw FilmPreparerError("Couldn't read that file.")
+            }
+            let preparer = FilmPreparer(input: film, plan: plan, tools: tools)
+            self.preparer = preparer
+            preparing = Preparing(fraction: 0, remuxOnly: plan.isRemuxOnly, speed: nil)
+            preparer.onProgress = { [weak self, weak preparer] fraction, speed in
+                guard let self, let preparer, preparer === self.preparer else { return }
+                self.preparing = Preparing(fraction: fraction, remuxOnly: plan.isRemuxOnly, speed: speed)
+                if Date().timeIntervalSince(self.lastPreparingSent) > 0.5 {
+                    self.lastPreparingSent = Date()
+                    self.control?.send(.preparing(fraction: fraction))
+                }
+            }
+            let name = film.deletingPathExtension().appendingPathExtension("mp4").lastPathComponent
+            preparer.start { [weak self, weak preparer] result in
+                guard let self, let preparer, preparer === self.preparer else { return }
+                switch result {
+                case .success(let url):
+                    do {
+                        try self.startSharing(url, name: name)
+                    } catch {
+                        self.preparationFailed(error.localizedDescription)
+                    }
+                case .failure(let error):
+                    if error is CancellationError { return }
+                    self.preparationFailed(error.localizedDescription)
+                }
+            }
+        }
         phase = .creatingRoom
         signaling.connect(to: settings.serverURL)
+    }
+
+    private func preparationFailed(_ message: String) {
+        preparer = nil
+        preparing = nil
+        leave()
+        phase = .ended(message)
+    }
+
+    /// Host: the film is ready; tell the guest (if already here) and start sending.
+    private func startSharing(_ file: URL, name: String) throws {
+        let sender = try FileSender(url: file, name: name)
+        self.sender = sender
+        preparing = nil
+        playback.load(asset: AVURLAsset(url: file))
+        if let control {
+            control.send(.fileInfo(sender.info))
+            control.send(.timeline(playback.engine.timeline))
+        }
+        if let fileChannel { sender.attach(fileChannel) }
     }
 
     /// Guest: join the room with this code.
@@ -105,6 +180,10 @@ public final class Party: ObservableObject {
     }
 
     public func leave() {
+        if let preparer {
+            preparer.cancel()
+            self.preparer = nil
+        }
         control?.send(.bye)
         signaling.leaveRoom()
         teardownCall()
@@ -112,6 +191,12 @@ public final class Party: ObservableObject {
         playback.unload()
         hub.stop()
         receiver = nil
+        sender?.detach()
+        if let sender, sender.url.path.hasPrefix(FilmPreparer.directory.path) {
+            try? FileManager.default.removeItem(at: sender.url)
+        }
+        sender = nil
+        preparing = nil
         phase = .ended("")
     }
 
@@ -195,9 +280,13 @@ public final class Party: ObservableObject {
         self.control = control
         control.send(.hello(role: role, protocolVersion: ControlMessage.protocolVersion))
         sendMediaState()
-        if role == .host, let sender {
-            control.send(.fileInfo(sender.info))
-            control.send(.timeline(playback.engine.timeline))
+        if role == .host {
+            if let sender {
+                control.send(.fileInfo(sender.info))
+                control.send(.timeline(playback.engine.timeline))
+            } else if let preparing {
+                control.send(.preparing(fraction: preparing.fraction))
+            }
         } else {
             control.send(.buffering(playback.engine.localBuffering, position: playback.currentTime))
             startClockSync()
@@ -213,6 +302,7 @@ public final class Party: ObservableObject {
             break
         case .fileInfo(let info):
             guard role == .guest, receiver == nil else { return }
+            preparing = nil
             receiveFilm(info)
         case .want(let chunks, let urgent):
             sender?.request(chunks, urgent: urgent)
@@ -230,6 +320,8 @@ public final class Party: ObservableObject {
             clock.add(t0: t0, t1: t1, t2: playback.localNow())
             playback.clockOffset = clock.offset
             clockRoundTrip = clock.bestRoundTrip ?? 0
+        case .preparing(let fraction):
+            if role == .guest, receiver == nil { preparing = Preparing(fraction: fraction, remuxOnly: false, speed: nil) }
         case .mediaState(let camera, let mic):
             partnerCameraOn = camera
             partnerMicOn = mic

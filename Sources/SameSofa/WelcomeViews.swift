@@ -35,6 +35,12 @@ struct WelcomeView: View {
                     model.chooseFilmAndHost()
                 }
             }
+            if model.inspecting {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Looking at the film…").foregroundStyle(Theme.secondaryText)
+                }
+            }
             if let notice = model.notice {
                 NoticeView(text: notice)
             }

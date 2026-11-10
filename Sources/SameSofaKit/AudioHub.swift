@@ -116,6 +116,8 @@ public final class AudioHub: NSObject, RTCAudioDevice {
 
     // Diagnostics (read from any thread; approximate).
     public private(set) var receivedVoiceLevel: Float = 0
+    /// Peak level of the film's sound being played (decays), for tests.
+    public private(set) var filmLevel: Float = 0
     public private(set) var sentFrames = 0
     public private(set) var engineError: String?
 
@@ -281,12 +283,13 @@ public final class AudioHub: NSObject, RTCAudioDevice {
         let stereo = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 2)!
         let maxLatency = Int(rate * 0.05)
         let ring = filmRing
-        let node = AVAudioSourceNode(format: stereo) { _, _, frames, abl in
+        let node = AVAudioSourceNode(format: stereo) { [weak self] _, _, frames, abl in
             let buffers = UnsafeMutableAudioBufferListPointer(abl)
             guard buffers.count >= 2,
                   let left = buffers[0].mData?.assumingMemoryBound(to: Float.self),
                   let right = buffers[1].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
             ring.read(frames: Int(frames), left: left, right: right, maxLatencyFrames: maxLatency)
+            self?.meterFilm(left: left, right: right, frames: Int(frames))
             return noErr
         }
         node.volume = filmVolume
@@ -356,14 +359,20 @@ public final class AudioHub: NSObject, RTCAudioDevice {
         return noErr
     }
 
+    private func meterFilm(left: UnsafePointer<Float>, right: UnsafePointer<Float>, frames: Int) {
+        var peak: Float = 0
+        for i in 0..<frames { peak = max(peak, abs(left[i]), abs(right[i])) }
+        filmLevel = max(peak, filmLevel * 0.97)
+    }
+
     // MARK: Synthetic mode (tests and screenshots): no microphone, no speakers.
 
     private func startSynthetic() {
         guard syntheticTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(flags: .strict, queue: syntheticQueue)
         timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(1))
-        var left = [Float](repeating: 0, count: Self.rtcFrames10ms)
-        var right = [Float](repeating: 0, count: Self.rtcFrames10ms)
+        var left = [Float](repeating: 0, count: 4096)
+        var right = [Float](repeating: 0, count: 4096)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             var ts = AudioTimeStamp()
@@ -383,7 +392,9 @@ public final class AudioHub: NSObject, RTCAudioDevice {
             // Drain the film ring as the real engine would.
             left.withUnsafeMutableBufferPointer { l in
                 right.withUnsafeMutableBufferPointer { r in
-                    self.filmRing.read(frames: Int(Double(frames) * self.filmRate / Self.rtcRate), left: l.baseAddress!, right: r.baseAddress!, maxLatencyFrames: Int(self.filmRate * 0.05))
+                    let filmFrames = min(Int(Double(frames) * self.filmRate / Self.rtcRate), l.count)
+                    self.filmRing.read(frames: filmFrames, left: l.baseAddress!, right: r.baseAddress!, maxLatencyFrames: Int(self.filmRate * 0.05))
+                    self.meterFilm(left: l.baseAddress!, right: r.baseAddress!, frames: filmFrames)
                 }
             }
             // "Microphone": a quiet 440 Hz tone.

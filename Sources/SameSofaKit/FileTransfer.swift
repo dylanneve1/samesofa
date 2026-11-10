@@ -22,12 +22,16 @@ final class FileSender: NSObject, RTCDataChannelDelegate {
     private var lastRefill = Date()
     private var throttleWakeScheduled = false
 
-    init(url: URL) throws {
+    let url: URL
+
+    /// `name` is what the guest is told the film is called (defaults to the file name).
+    init(url: URL, name: String? = nil) throws {
         throttleBytesPerSecond = ProcessInfo.processInfo.environment["SAMESOFA_THROTTLE_BPS"].flatMap(Double.init)
+        self.url = url
         let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
         let uti = UTType(filenameExtension: url.pathExtension)?.identifier ?? UTType.mpeg4Movie.identifier
-        info = FileInfo(size: size, name: url.lastPathComponent, uti: uti)
+        info = FileInfo(size: size, name: name ?? url.lastPathComponent, uti: uti)
         handle = try FileHandle(forReadingFrom: url)
     }
 

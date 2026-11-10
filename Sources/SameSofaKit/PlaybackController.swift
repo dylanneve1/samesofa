@@ -16,6 +16,10 @@ public final class PlaybackController: ObservableObject {
     @Published public private(set) var localBuffering = false
     @Published public private(set) var isLoaded = false
     @Published public private(set) var hasVideo = true
+    /// The film carries a text subtitle track (from MKV or a .srt, converted to MP4).
+    @Published public private(set) var hasSubtitles = false
+    @Published public private(set) var subtitlesOn = false
+    private var subtitleGroup: AVMediaSelectionGroup?
 
     public private(set) var engine: SyncEngine
     private let hub: AudioHub
@@ -73,8 +77,14 @@ public final class PlaybackController: ObservableObject {
             let duration = (try? await asset.load(.duration))?.seconds ?? 0
             let audioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
             let videoTracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+            let legible = try? await asset.loadMediaSelectionGroup(for: .legible)
             await MainActor.run {
-                guard let self else { return }
+                guard let self, self.player.currentItem === item else { return }
+                self.subtitleGroup = legible
+                self.hasSubtitles = !(legible?.options.isEmpty ?? true)
+                // Off by default; the toggle in the controls turns them on.
+                if let legible { item.select(nil, in: legible) }
+                self.subtitlesOn = false
                 self.duration = duration.isFinite ? duration : 0
                 self.hasVideo = !videoTracks.isEmpty
                 if let track = audioTracks.first, let mix = FilmAudioTap.audioMix(for: track, hub: self.hub) {
@@ -85,7 +95,23 @@ public final class PlaybackController: ObservableObject {
         }
     }
 
+    /// Shows or hides the film's subtitles (each side chooses for itself).
+    public func setSubtitles(_ on: Bool) {
+        guard let group = subtitleGroup, let item = player.currentItem else { return }
+        item.select(on ? group.options.first : nil, in: group)
+        subtitlesOn = on && !group.options.isEmpty
+    }
+
+    /// The subtitle option the player is showing, if any (for tests).
+    public var selectedSubtitle: AVMediaSelectionOption? {
+        guard let group = subtitleGroup else { return nil }
+        return player.currentItem?.currentMediaSelection.selectedMediaOption(in: group)
+    }
+
     public func unload() {
+        hasSubtitles = false
+        subtitlesOn = false
+        subtitleGroup = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
         observers = []

@@ -4,6 +4,7 @@ import Combine
 import SameSofaCore
 import SameSofaKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Settings the user (well, the technical one of the two) can change.
 final class AppSettings: ObservableObject {
@@ -56,6 +57,8 @@ struct LaunchOptions {
     var synthetic = false
     var label = "Me"
     var autoPlay = false
+    /// Turn subtitles on as soon as the film has them.
+    var subtitles = false
     /// Screenshots only: open on a given screen with a partly typed code.
     var screen: String?
     var prefill: String?
@@ -75,6 +78,7 @@ struct LaunchOptions {
             case "--synthetic": synthetic = true
             case "--label": label = args.popFirst() ?? label
             case "--autoplay": autoPlay = true
+            case "--subtitles": subtitles = true
             case "--screen": screen = args.popFirst()
             case "--prefill": prefill = args.popFirst()
             case "--type-test": typeTest = args.popFirst()
@@ -99,9 +103,24 @@ final class AppModel: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
     private let options = LaunchOptions.shared
 
+    /// The host's Mac is checking the film it was given (ffprobe), before the room opens.
+    @Published var inspecting = false
+
     init() {
+        // Converted films from a session that didn't end cleanly.
+        FilmPreparer.removeLeftovers()
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            // Stops a running conversion and deletes the converted film.
+            self?.party?.leave()
+            FilmPreparer.removeLeftovers()
+        }
         DispatchQueue.main.async { self.runLaunchOptions() }
     }
+
+    /// Containers the host can pick. MP4/MOV are shared as they are; the rest
+    /// are converted to MP4 by the FFmpeg helper first.
+    static let filmExtensions = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "divx", "xvid", "ts", "m2ts", "mts",
+                                 "flv", "wmv", "asf", "mpg", "mpeg", "vob", "ogv", "ogm", "3gp", "3g2", "rm", "rmvb"]
 
     private func runLaunchOptions() {
         if let film = options.hostFilm { startHosting(film: film) }
@@ -125,7 +144,8 @@ final class AppModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.title = "Choose a film to watch together"
         panel.prompt = "Watch this"
-        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie, .audiovisualContent]
+        let extra = Self.filmExtensions.compactMap { UTType(filenameExtension: $0, conformingTo: .movie) }
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie, .audiovisualContent] + extra
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         startHosting(film: url)
@@ -136,16 +156,21 @@ final class AppModel: ObservableObject {
         notice = nil
         Task { @MainActor in
             await Self.requestPermissions(synthetic: options.synthetic)
-            // Check the film plays at all before opening a room.
-            let asset = AVURLAsset(url: film)
-            let playable = (try? await asset.load(.isPlayable)) ?? false
-            guard playable else {
-                self.notice = "That file can't be played by macOS (formats like MKV and AVI aren't supported yet). Try an MP4 or MOV file."
+            // Check the film before opening a room: shared as it is, converted
+            // first (MKV, AVI, ...), or not usable at all.
+            self.inspecting = true
+            let check: FilmCheck
+            do {
+                check = try await FilmPreparer.inspect(film)
+            } catch {
+                self.inspecting = false
+                self.notice = error.localizedDescription
                 return
             }
+            self.inspecting = false
             let party = Party(role: .host, settings: ps)
             do {
-                try party.host(film: film)
+                try party.host(film: film, check: check)
             } catch {
                 self.notice = "Couldn't open that file: \(error.localizedDescription)"
                 return
@@ -178,6 +203,10 @@ final class AppModel: ObservableObject {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4) { party.playback.play() }
             }
         }.store(in: &cancellables)
+        if options.subtitles {
+            party.playback.$hasSubtitles.filter { $0 }.first().receive(on: DispatchQueue.main)
+                .sink { [weak party] _ in party?.playback.setSubtitles(true) }.store(in: &cancellables)
+        }
         // Forward changes so views observing the model refresh.
         party.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &cancellables)
     }
