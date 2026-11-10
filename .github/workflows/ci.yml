@@ -1,9 +1,10 @@
 name: CI
 
+# Manual for now: GitHub Actions would not start jobs on this repository while
+# it was private. Once it is public (macOS runners are free for public repos),
+# replace this with:  on: { push: { branches: [main] }, pull_request: {} }
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   server:
