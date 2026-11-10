@@ -43,7 +43,9 @@ jobs:
           path: Vendor/FFmpeg
           key: ffmpeg-arm64-${{ hashFiles('scripts/build-ffmpeg.sh') }}
       - name: Build FFmpeg helper (arm64, LGPL)
-        run: SAMESOFA_ARCHS=arm64 scripts/build-ffmpeg.sh
+        run: |
+          brew install meson ninja pkg-config
+          SAMESOFA_ARCHS=arm64 scripts/build-ffmpeg.sh
       - name: Check the FFmpeg helper is LGPL only
         run: |
           Vendor/FFmpeg/bin/ffmpeg -hide_banner -buildconf

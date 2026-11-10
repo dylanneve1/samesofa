@@ -10,6 +10,7 @@ copied into the app (SameSofa ▸ Acknowledgements…, and
 | [WebRTC](https://webrtc.org) M157, prebuilt by [stasel/WebRTC](https://github.com/stasel/WebRTC) | BSD-3-Clause + WebRTC patent grant | `WebRTC.framework` inside the app | calls, data channels |
 | `RTCAudioDevice.h` from WebRTC | BSD-3-Clause | `Sources/CWebRTCAudioDevice` | custom audio device protocol |
 | [FFmpeg](https://ffmpeg.org) 8.1.3 | LGPL-2.1-or-later | `ffmpeg`, `ffprobe` in `Contents/Helpers`, `libav*.dylib`/`libsw*.dylib` in `Contents/Frameworks` | converting MKV, AVI, WebM, ... to MP4 on the host |
+| [dav1d](https://code.videolan.org/videolan/dav1d) 1.5.4 | BSD-2-Clause | linked statically into `libavcodec.62.dylib` | decoding AV1 video during conversion |
 | [ws](https://github.com/websockets/ws) | MIT | room server only (installed by npm, not part of the app) | WebSocket server |
 | Apple SF Symbols | Apple's terms, via the system | the system | icons in the app |
 
@@ -101,7 +102,7 @@ from the FFmpeg sources) and at https://www.gnu.org/licenses/old-licenses/lgpl-2
   with these options (per architecture, arm64 and x86_64, then merged):
 
   ```
-  --disable-gpl --disable-nonfree --disable-version3
+  --disable-gpl --disable-nonfree --disable-version3 --enable-libdav1d
   --enable-shared --disable-static --install-name-dir=@rpath
   --disable-autodetect --enable-videotoolbox --enable-audiotoolbox --enable-zlib --enable-bzlib
   --disable-doc --disable-ffplay --disable-avdevice --disable-network --disable-devices --disable-debug
@@ -111,9 +112,11 @@ from the FFmpeg sources) and at https://www.gnu.org/licenses/old-licenses/lgpl-2
   --disable-protocols --enable-protocol=file,pipe
   ```
 
-  No GPL or nonfree parts and no external codec libraries (no x264/x265);
-  video is encoded with Apple's VideoToolbox, audio with FFmpeg's own AAC
-  encoder. The exact configuration of a build is in
+  No GPL or nonfree parts and no x264/x265: video is encoded with Apple's
+  VideoToolbox, audio with FFmpeg's own AAC encoder. The only external
+  library is dav1d (AV1 decoder, BSD-2-Clause, see below), built by the same
+  script from https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz
+  (SHA-256 `686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5`). The exact configuration of a build is in
   `Contents/Resources/FFmpeg/BUILDINFO.txt` (`ffmpeg -buildconf`).
 - **Separate and replaceable:** FFmpeg is not linked into SameSofa. The app runs
   `Contents/Helpers/ffmpeg` and `ffprobe` as separate programs, which load
@@ -123,6 +126,36 @@ from the FFmpeg sources) and at https://www.gnu.org/licenses/old-licenses/lgpl-2
   places and re-sign the app (`codesign --force --deep --sign - SameSofa.app`).
 
 FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
+
+### dav1d
+
+Linked statically into the FFmpeg helper's `libavcodec` (unmodified, version
+1.5.4). Licence (also in `Contents/Resources/FFmpeg/COPYING.dav1d`):
+
+```
+Copyright © 2018-2025, VideoLAN and dav1d authors
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.```
 
 ---
 

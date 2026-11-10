@@ -43,7 +43,7 @@ if [ "${SAMESOFA_NO_FFMPEG:-}" != 1 ]; then
   mkdir -p "$APP/Contents/Helpers" "$APP/Contents/Resources/FFmpeg"
   cp Vendor/FFmpeg/bin/ffmpeg Vendor/FFmpeg/bin/ffprobe "$APP/Contents/Helpers/"
   cp Vendor/FFmpeg/lib/*.dylib "$APP/Contents/Frameworks/"
-  cp Vendor/FFmpeg/BUILDINFO.txt Vendor/FFmpeg/COPYING.LGPLv2.1 "$APP/Contents/Resources/FFmpeg/"
+  cp Vendor/FFmpeg/BUILDINFO.txt Vendor/FFmpeg/COPYING.LGPLv2.1 Vendor/FFmpeg/COPYING.dav1d "$APP/Contents/Resources/FFmpeg/"
 fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST

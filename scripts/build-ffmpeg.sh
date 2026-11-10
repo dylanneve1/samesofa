@@ -2,7 +2,8 @@
 # Builds the FFmpeg helper that SameSofa uses to turn MKV, AVI, WebM and other
 # containers into MP4 on the host's Mac before sharing.
 #
-# LGPL only: no --enable-gpl, no --enable-nonfree, no external codec libraries.
+# LGPL only: no --enable-gpl, no --enable-nonfree. The one external library is
+# dav1d (BSD-2-Clause), the AV1 decoder, linked statically into libavcodec.
 # Video is encoded with Apple's VideoToolbox (hardware), audio with FFmpeg's
 # own AAC encoder. FFmpeg is built as shared libraries plus the ffmpeg and
 # ffprobe programs, which the app runs as separate processes, so the LGPL code
@@ -22,6 +23,9 @@ ROOT=$(pwd)
 FFMPEG_VERSION=8.1.3
 FFMPEG_SHA256=7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
 FFMPEG_URL="https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
+DAV1D_VERSION=1.5.4
+DAV1D_SHA256=686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5
+DAV1D_URL="https://downloads.videolan.org/pub/videolan/dav1d/$DAV1D_VERSION/dav1d-$DAV1D_VERSION.tar.xz"
 ARCHS=${SAMESOFA_ARCHS:-"arm64 x86_64"}
 MIN_MACOS=14.0
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -30,7 +34,7 @@ export DEVELOPER_DIR=${DEVELOPER_DIR:-$(xcode-select -p)}
 # Everything that decides what goes into the binaries. Decoders, demuxers,
 # parsers and bitstream filters are all FFmpeg's own (LGPL) and stay enabled,
 # so the helper can read almost anything; only what SameSofa writes is limited.
-COMMON_FLAGS="--disable-gpl --disable-nonfree --disable-version3
+COMMON_FLAGS="--disable-gpl --disable-nonfree --disable-version3 --enable-libdav1d
  --enable-shared --disable-static --install-name-dir=@rpath
  --disable-autodetect --enable-videotoolbox --enable-audiotoolbox --enable-zlib --enable-bzlib
  --disable-doc --disable-ffplay --disable-avdevice --disable-network --disable-devices --disable-debug
@@ -51,21 +55,31 @@ fi
 # and a home folder path has no business inside the app.
 WORK=${SAMESOFA_FFMPEG_WORK:-/tmp/samesofa-ffmpeg-build}
 mkdir -p "$WORK" "$ROOT/Vendor"
-TARBALL="$ROOT/Vendor/ffmpeg-$FFMPEG_VERSION.tar.xz"
-if [ ! -f "$TARBALL" ]; then
-  echo "Downloading FFmpeg $FFMPEG_VERSION..."
-  curl -fsSL --retry 3 -o "$TARBALL.part" "$FFMPEG_URL"
-  mv "$TARBALL.part" "$TARBALL"
-fi
-echo "$FFMPEG_SHA256  $TARBALL" | shasum -a 256 -c - >/dev/null || {
-  echo "Checksum mismatch for $TARBALL" >&2
-  rm -f "$TARBALL"
-  exit 1
+fetch() { # url sha256 file
+  if [ ! -f "$3" ]; then
+    echo "Downloading $(basename "$3")..."
+    curl -fsSL --retry 3 -o "$3.part" "$1"
+    mv "$3.part" "$3"
+  fi
+  echo "$2  $3" | shasum -a 256 -c - >/dev/null || {
+    echo "Checksum mismatch for $3" >&2
+    rm -f "$3"
+    exit 1
+  }
 }
+TARBALL="$ROOT/Vendor/ffmpeg-$FFMPEG_VERSION.tar.xz"
+DAV1D_TARBALL="$ROOT/Vendor/dav1d-$DAV1D_VERSION.tar.xz"
+fetch "$FFMPEG_URL" "$FFMPEG_SHA256" "$TARBALL"
+fetch "$DAV1D_URL" "$DAV1D_SHA256" "$DAV1D_TARBALL"
+for tool in meson ninja pkg-config; do
+  command -v $tool >/dev/null 2>&1 || { echo "error: $tool is needed (brew install meson ninja pkg-config)" >&2; exit 1; }
+done
 
 SRC="$WORK/ffmpeg-$FFMPEG_VERSION"
-rm -rf "$SRC"
+DAV1D_SRC="$WORK/dav1d-$DAV1D_VERSION"
+rm -rf "$SRC" "$DAV1D_SRC"
 tar -xf "$TARBALL" -C "$WORK"
+tar -xf "$DAV1D_TARBALL" -C "$WORK"
 
 # Neither the SDK path nor the build folder may end up in the binaries
 # (ffmpeg -buildconf prints its configure line), so the SDK comes from the
@@ -90,11 +104,36 @@ for arch in $ARCHS; do
   fi
   CROSS=""
   [ "$arch" != "$(uname -m)" ] && CROSS="--enable-cross-compile"
+
+  echo "Building dav1d for $arch..."
+  DAV1D_PREFIX="$WORK/dav1d-$arch"
+  rm -rf "$DAV1D_PREFIX" "$WORK/dav1d-build-$arch"
+  cat >"$WORK/meson-$arch.txt" <<MESON
+[binaries]
+c = ['clang', '-arch', '$arch']
+ar = 'ar'
+strip = 'strip'
+nasm = 'nasm'
+[built-in options]
+c_args = ['-mmacosx-version-min=$MIN_MACOS']
+c_link_args = ['-mmacosx-version-min=$MIN_MACOS']
+[host_machine]
+system = 'darwin'
+cpu_family = '$FFARCH'
+cpu = '$FFARCH'
+endian = 'little'
+MESON
+  (cd "$WORK" && meson setup "dav1d-build-$arch" "dav1d-$DAV1D_VERSION" --cross-file "meson-$arch.txt" \
+     --prefix="$DAV1D_PREFIX" --libdir=lib --buildtype=release --default-library=static \
+     -Denable_tools=false -Denable_tests=false -Denable_examples=false >"$WORK/dav1d-$arch.log" 2>&1 &&
+   ninja -C "dav1d-build-$arch" install >>"$WORK/dav1d-$arch.log" 2>&1) || { tail -30 "$WORK/dav1d-$arch.log"; exit 1; }
+  export PKG_CONFIG_LIBDIR="$DAV1D_PREFIX/lib/pkgconfig"
+
   # shellcheck disable=SC2086
   # A relative path to the sources keeps the build folder out of __FILE__ strings.
   (cd "$BUILD" && "../ffmpeg-$FFMPEG_VERSION/configure" \
     --prefix=/ffmpeg --arch="$FFARCH" --target-os=darwin $CROSS $ASM_FLAGS \
-    --cc="clang -arch $arch" \
+    --cc="clang -arch $arch" --pkg-config=pkg-config --pkg-config-flags=--static \
     --extra-cflags="-mmacosx-version-min=$MIN_MACOS" \
     --extra-ldflags="-mmacosx-version-min=$MIN_MACOS" \
     --extra-ldexeflags="-Wl,-rpath,@executable_path/../Frameworks -Wl,-rpath,@executable_path/../lib" \
@@ -134,6 +173,7 @@ done
   echo "SHA-256: $FFMPEG_SHA256"
   echo "Architectures: $ARCHS (macOS $MIN_MACOS+)"
   echo "Licence: LGPL-2.1-or-later (no GPL or nonfree components)"
+  echo "With dav1d $DAV1D_VERSION (BSD-2-Clause), $DAV1D_URL, SHA-256 $DAV1D_SHA256"
   echo
   DYLD_LIBRARY_PATH="$OUT/lib" "$OUT/bin/ffmpeg" -hide_banner -buildconf 2>&1 || true
 } >"$OUT/BUILDINFO.txt"
@@ -146,6 +186,7 @@ if grep -q "$HOME" "$OUT/BUILDINFO.txt" || strings "$OUT/bin/ffmpeg" "$OUT/lib/"
   exit 1
 fi
 cp "$SRC/COPYING.LGPLv2.1" "$OUT/COPYING.LGPLv2.1"
+cp "$DAV1D_SRC/COPYING" "$OUT/COPYING.dav1d"
 echo "$STAMP_TEXT" >"$OUT/.stamp"
 echo "FFmpeg $FFMPEG_VERSION ready in Vendor/FFmpeg:"
 ls -la "$OUT/bin" "$OUT/lib" | sed 's/^/  /'
