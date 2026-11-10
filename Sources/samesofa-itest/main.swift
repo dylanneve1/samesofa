@@ -23,6 +23,19 @@ guard let server = args["server"].flatMap(URL.init(string:)), let filmPath = arg
     exit(2)
 }
 let filmURL = URL(fileURLWithPath: filmPath)
+
+// Optional: start the real voice-processing audio engine at zero volume and
+// report whether it runs on this machine (it needs a microphone).
+if args["audio-check"] != nil {
+    let hub = AudioHub(mode: .voiceProcessing)
+    hub.filmVolume = 0
+    hub.voiceVolume = 0
+    hub.start()
+    RunLoop.main.run(until: Date().addingTimeInterval(2))
+    print("voice processing: \(hub.voiceProcessingFailed ? "unavailable, fell back" : "active"); engine: \(hub.engineError ?? "running")")
+    hub.stop()
+    exit(0)
+}
 let soakSeconds = Double(args["soak"] ?? "120") ?? 120
 if let throttle = args["throttle"] { setenv("SAMESOFA_THROTTLE_BPS", throttle, 1) }
 

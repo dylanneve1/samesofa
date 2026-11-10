@@ -187,11 +187,52 @@ public final class AudioHub: NSObject, RTCAudioDevice {
     public func start() {
         if mode == .synthetic { startSynthetic(); return }
         if let engine, engine.isRunning { return }
+        if mode == .voiceProcessing, !voiceProcessingFailed {
+            if let error = startEngine(voiceProcessing: true) {
+                // E.g. no microphone, or an audio device voice processing can't drive.
+                // Better to have the film and the voice without echo cancellation than nothing.
+                NSLog("SameSofa: voice processing unavailable (\(error)); continuing without it")
+                voiceProcessingFailed = true
+                teardownEngine()
+            } else {
+                return
+            }
+        }
+        if let error = startEngine(voiceProcessing: false) {
+            engineError = "\(error)"
+            NSLog("SameSofa audio engine failed: \(error)")
+            teardownEngine()
+        }
+    }
+
+    /// True when echo cancellation was requested but could not be started.
+    public private(set) var voiceProcessingFailed = false
+    /// Whether Apple voice processing is actually active right now.
+    public var voiceProcessingActive: Bool { mode == .voiceProcessing && !voiceProcessingFailed && engine?.isRunning == true }
+
+    private func teardownEngine() {
+        engine?.stop()
+        engine = nil
+        voiceNode = nil
+        filmNode = nil
+        sinkNode = nil
+        converter = nil
+    }
+
+    private struct NoMicrophone: Error, CustomStringConvertible {
+        var description: String { "no microphone connected" }
+    }
+
+    private func startEngine(voiceProcessing: Bool) -> Error? {
+        // Touching AVAudioEngine.inputNode without any input device raises an
+        // Objective-C exception, so check first.
+        let hasMicrophone = AVCaptureDevice.default(for: .audio) != nil
+        if voiceProcessing && !hasMicrophone { return NoMicrophone() }
         let engine = AVAudioEngine()
         self.engine = engine
         do {
-            let input = engine.inputNode
-            if mode == .voiceProcessing {
+            let input: AVAudioInputNode? = hasMicrophone ? engine.inputNode : nil
+            if voiceProcessing, let input {
                 try input.setVoiceProcessingEnabled(true)
                 // Do not turn other apps (or our own film) down while talking.
                 input.voiceProcessingOtherAudioDuckingConfiguration =
@@ -209,8 +250,8 @@ public final class AudioHub: NSObject, RTCAudioDevice {
 
             attachFilmNode(to: engine, rate: filmRate)
 
-            let inputFormat = input.outputFormat(forBus: 0)
-            if inputFormat.sampleRate > 0, inputFormat.channelCount > 0 {
+            if let input, input.inputFormat(forBus: 0).sampleRate > 0, input.inputFormat(forBus: 0).channelCount > 0,
+               case let inputFormat = input.outputFormat(forBus: 0), inputFormat.sampleRate > 0, inputFormat.channelCount > 0 {
                 let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Self.rtcRate, channels: 1, interleaved: true)!
                 converter = AVAudioConverter(from: inputFormat, to: target)
                 let sink = AVAudioSinkNode { [weak self] timestamp, frames, abl in
@@ -223,18 +264,14 @@ public final class AudioHub: NSObject, RTCAudioDevice {
             engine.prepare()
             try engine.start()
             engineError = nil
+            return nil
         } catch {
-            engineError = "\(error)"
-            NSLog("SameSofa audio engine failed: \(error)")
+            return error
         }
     }
 
     public func stop() {
-        engine?.stop()
-        engine = nil
-        voiceNode = nil
-        filmNode = nil
-        sinkNode = nil
+        teardownEngine()
         syntheticTimer?.cancel()
         syntheticTimer = nil
     }
