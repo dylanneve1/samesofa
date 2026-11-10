@@ -22,7 +22,7 @@ final class MessageTests: XCTestCase {
             .progress(fraction: 0.5),
             .timeline(Timeline(playing: true, position: 12.5, anchor: 1000.25, seq: 7, origin: .guest)),
             .heartbeat(Timeline(playing: false, position: 3, anchor: 2, seq: 1, origin: .host), actualPosition: 3.01),
-            .buffering(true),
+            .buffering(true, position: 12.5),
             .ping(t0: 1.5), .pong(t0: 1.5, t1: 99.25),
             .mediaState(cameraOn: false, micOn: true),
             .bye,
@@ -214,6 +214,8 @@ final class SyncTests: XCTestCase {
         XCTAssertEqual(host.targetPosition(at: 30), 19.7, accuracy: 1e-9)
         // Guest recovers: only the host issues the restart.
         XCTAssertNil(guest.setLocalBuffering(false, now: 25, actualPosition: 19.5))
+        XCTAssertFalse(guest.effectivePlaying) // still waiting for the host's restart
+        XCTAssertTrue(guest.awaitingRestart)
         guard let restart = host.setRemoteBuffering(false, now: 25.05, actualPosition: 19.7) else { return XCTFail() }
         XCTAssertTrue(restart.playing)
         XCTAssertTrue(guest.receive(restart))

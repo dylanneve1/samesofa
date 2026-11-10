@@ -75,7 +75,8 @@ public enum ControlMessage: Codable, Equatable, Sendable {
     /// player actually is. Lets a guest that missed something catch up.
     case heartbeat(Timeline, actualPosition: Double)
     /// Either side: "my player is starved / ready again".
-    case buffering(Bool)
+    /// `position` is where this side's player stopped, so both can resume from there.
+    case buffering(Bool, position: Double)
     /// Clock sync: guest sends ping with its own time, host answers with its time.
     case ping(t0: Double)
     case pong(t0: Double, t1: Double)

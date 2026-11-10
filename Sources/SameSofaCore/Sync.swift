@@ -70,8 +70,11 @@ public struct SyncEngine: Sendable {
     }
 
     /// Playback should actually be moving right now.
-    public var effectivePlaying: Bool { timeline.playing && !localBuffering && !remoteBuffering }
-    public var isHeld: Bool { timeline.playing && (localBuffering || remoteBuffering) }
+    public var effectivePlaying: Bool { timeline.playing && !localBuffering && !remoteBuffering && !awaitingRestart }
+    /// A hold has cleared on the guest, and it is waiting for the host to
+    /// schedule the common restart.
+    public var awaitingRestart: Bool { timeline.playing && timeline.anchor == .greatestFiniteMagnitude }
+    public var isHeld: Bool { timeline.playing && (localBuffering || remoteBuffering || awaitingRestart) }
 
     private mutating func next(playing: Bool, position: Double, anchor: Double) -> Timeline {
         timeline = Timeline(playing: playing, position: max(0, position), anchor: anchor,
