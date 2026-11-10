@@ -1,9 +1,13 @@
 name: CI
 
+# Manual only while GitHub Actions is unavailable for this account; to run on
+# every push and pull request again, replace the "on:" block with:
+#   on:
+#     push:
+#       branches: [main]
+#     pull_request:
+#     workflow_dispatch:
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 jobs:
