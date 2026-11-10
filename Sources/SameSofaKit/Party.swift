@@ -199,7 +199,7 @@ public final class Party: ObservableObject {
             control.send(.fileInfo(sender.info))
             control.send(.timeline(playback.engine.timeline))
         } else {
-            control.send(.buffering(playback.engine.localBuffering))
+            control.send(.buffering(playback.engine.localBuffering, position: playback.currentTime))
             startClockSync()
         }
     }
@@ -222,8 +222,8 @@ public final class Party: ObservableObject {
             playback.receive(timeline)
         case .heartbeat(let timeline, let actual):
             playback.receiveHeartbeat(timeline, actual: actual)
-        case .buffering(let buffering):
-            playback.remoteBuffering(buffering)
+        case .buffering(let buffering, let position):
+            playback.remoteBuffering(buffering, at: position)
         case .ping(let t0):
             control?.send(.pong(t0: t0, t1: playback.localNow()))
         case .pong(let t0, let t1):

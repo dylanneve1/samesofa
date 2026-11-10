@@ -34,6 +34,7 @@ public final class PlaybackController: ObservableObject {
     private var lastCorrectionAt: Double = 0
     private var stallWatch: (position: Double, since: Double)?
     private var lastHeartbeat: Double = 0
+    private var correctionSeeks: [Double] = []
     private var observers: [NSKeyValueObservation] = []
 
     public init(role: PeerRole, hub: AudioHub) {
@@ -128,9 +129,11 @@ public final class PlaybackController: ObservableObject {
         receive(timeline)
     }
 
-    func remoteBuffering(_ buffering: Bool) {
+    func remoteBuffering(_ buffering: Bool, at remotePosition: Double) {
         if buffering { holdCount += 1 }
-        if let restart = engine.setRemoteBuffering(buffering, now: sharedNow, actualPosition: currentTime) {
+        // Resume from whichever side stopped earlier, so nobody misses a moment.
+        let position = buffering ? min(currentTime, remotePosition) : currentTime
+        if let restart = engine.setRemoteBuffering(buffering, now: sharedNow, actualPosition: position) {
             send?(.timeline(restart))
         }
         apply()
@@ -160,6 +163,7 @@ public final class PlaybackController: ObservableObject {
         guard player.currentItem != nil else { return }
         let now = sharedNow
         let target = engine.targetPosition(at: now)
+        Log.debug("\(engine.role) apply playing=\(engine.timeline.playing) effective=\(engine.effectivePlaying) held=\(engine.isHeld) target=\(String(format: "%.2f", target)) actual=\(String(format: "%.2f", currentTime)) anchorIn=\(String(format: "%.2f", engine.timeline.anchor - now))")
         guard engine.effectivePlaying else {
             pendingStartUntil = 0
             player.rate = 0
@@ -170,18 +174,37 @@ public final class PlaybackController: ObservableObject {
         let local = localNow()
         if anchorLocal > local + 0.03 {
             // Scheduled start: be at the right frame and start at the same instant as the other side.
-            let timeline = engine.timeline
-            player.rate = 0
-            pendingStartUntil = anchorLocal + 0.3
-            seekPrecisely(to: timeline.position, thenPlay: false) { [weak self] in
-                guard let self, self.engine.timeline == timeline else { return }
-                let hostTime = CMTime(seconds: anchorLocal - self.testClockSkew, preferredTimescale: 1_000_000_000)
-                self.player.setRate(1, time: CMTime(seconds: timeline.position, preferredTimescale: 600), atHostTime: hostTime)
-            }
+            startSynced(atLocal: anchorLocal)
         } else if abs(currentTime - target) > 0.5 {
-            seekPrecisely(to: target + 0.15, thenPlay: true)
+            startSynced(atLocal: local + 0.5)
         } else {
             player.rate = 1
+        }
+    }
+
+    /// Seeks to wherever the timeline will be at local time `startLocal` and
+    /// starts playing exactly then. Precise seeks in films with sparse
+    /// keyframes can be slow; if the seek finishes too late, it tries again
+    /// with a longer lead instead of starting behind.
+    private func startSynced(atLocal startLocal: Double, attempt: Int = 0) {
+        let timeline = engine.timeline
+        let startShared = startLocal + clockOffset
+        let position = engine.targetPosition(at: startShared)
+        player.rate = 0
+        pendingStartUntil = startLocal + 0.4
+        let began = localNow()
+        seekPrecisely(to: position, thenPlay: false) { [weak self] in
+            guard let self, self.engine.timeline == timeline, self.engine.effectivePlaying else { return }
+            let local = self.localNow()
+            Log.debug("\(self.engine.role) seek done after \(String(format: "%.2f", local - began)) s, start in \(String(format: "%.2f", startLocal - local)) s")
+            if local > startLocal - 0.01 {
+                guard attempt < 4 else { self.player.rate = 1; return }
+                let took = local - began
+                self.startSynced(atLocal: local + min(3, max(0.5, took * 1.5)), attempt: attempt + 1)
+                return
+            }
+            let hostTime = CMTime(seconds: startLocal - self.testClockSkew, preferredTimescale: 1_000_000_000)
+            self.player.setRate(1, time: CMTime(seconds: position, preferredTimescale: 600), atHostTime: hostTime)
         }
     }
 
@@ -228,7 +251,18 @@ public final class PlaybackController: ObservableObject {
         case .seek(let target):
             guard local - lastSeekAt > 1.5 else { return }
             if engine.effectivePlaying {
-                seekPrecisely(to: target + 0.15, thenPlay: true)
+                // Falling behind because the film hasn't arrived yet is buffering,
+                // not drift: seeking forward into missing data would just stall again.
+                correctionSeeks = correctionSeeks.filter { local - $0 < 8 } + [local]
+                if !(hasEnoughAhead?(target) ?? true) || correctionSeeks.count >= 3 {
+                    correctionSeeks.removeAll()
+                    holdCount += 1
+                    _ = engine.setLocalBuffering(true, now: now, actualPosition: actual)
+                    send?(.buffering(true, position: actual))
+                    apply()
+                    return
+                }
+                startSynced(atLocal: local + 0.5)
             } else {
                 seekPrecisely(to: target, thenPlay: false)
             }
@@ -254,7 +288,7 @@ public final class PlaybackController: ObservableObject {
             if starved {
                 holdCount += 1
                 _ = engine.setLocalBuffering(true, now: now, actualPosition: actual)
-                send?(.buffering(true))
+                send?(.buffering(true, position: actual))
                 apply()
             }
         } else {
@@ -262,7 +296,7 @@ public final class PlaybackController: ObservableObject {
             if enough {
                 stallWatch = nil
                 let restart = engine.setLocalBuffering(false, now: now, actualPosition: actual)
-                send?(.buffering(false))
+                send?(.buffering(false, position: actual))
                 if let restart { send?(.timeline(restart)) }
                 apply()
             }
