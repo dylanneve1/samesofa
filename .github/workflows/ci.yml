@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test
+
+  app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch WebRTC
+        run: scripts/fetch-webrtc.sh
+      - name: Unit tests
+        run: swift test
+      - name: Build app bundle (Apple silicon)
+        run: SAMESOFA_ARCHS=arm64 scripts/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SameSofa-unsigned-arm64
+          path: dist/*.zip
+          retention-days: 7
