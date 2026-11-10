@@ -1,6 +1,9 @@
 // swift-tools-version:5.10
 import PackageDescription
 
+// WebRTC's audio processing module, built by scripts/build-apm.sh.
+let apm = "\(Context.packageDirectory)/Vendor/APM"
+
 let package = Package(
     name: "SameSofa",
     platforms: [.macOS(.v14)],
@@ -22,6 +25,24 @@ let package = Package(
         ),
         // C wrapper for MTAudioProcessingTapCreate.
         .target(name: "CAudioTap", linkerSettings: [.linkedFramework("MediaToolbox")]),
+        // C interface to the echo canceller (WebRTC AEC3 from webrtc-audio-processing,
+        // BSD-3-Clause; static library built by scripts/build-apm.sh).
+        .target(
+            name: "CEchoCanceller",
+            cxxSettings: [
+                .unsafeFlags(["-I\(apm)/include"]),
+                .define("WEBRTC_POSIX"), .define("WEBRTC_MAC"), .define("WEBRTC_LIBRARY_IMPL"),
+                // The library is built without debug checks; its headers must agree.
+                .define("NDEBUG"),
+            ],
+            linkerSettings: [
+                .unsafeFlags(["-L\(apm)/lib"]),
+                .linkedLibrary("samesofa-apm"),
+                .linkedLibrary("c++"),
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("Foundation"),
+            ]
+        ),
         // Calls, file transfer, playback and audio. Shared by the app and the integration test.
         .target(
             name: "SameSofaKit",
@@ -29,6 +50,7 @@ let package = Package(
                 "SameSofaCore",
                 "CWebRTCAudioDevice",
                 "CAudioTap",
+                "CEchoCanceller",
                 "WebRTC",
             ]
         ),
@@ -38,9 +60,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "samesofa-itest",
-            dependencies: ["SameSofaKit", "SameSofaCore", "WebRTC"]
+            dependencies: ["SameSofaKit", "SameSofaCore", "CEchoCanceller", "WebRTC"]
         ),
         .testTarget(name: "SameSofaCoreTests", dependencies: ["SameSofaCore"]),
     ],
-    swiftLanguageVersions: [.v5]
+    swiftLanguageVersions: [.v5],
+    cxxLanguageStandard: .cxx17
 )
