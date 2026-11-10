@@ -1,4 +1,5 @@
 import AVFoundation
+import CAudioTap
 import MediaToolbox
 
 /// Pulls the film's decoded audio out of AVPlayer (MTAudioProcessingTap),
@@ -55,9 +56,7 @@ final class FilmAudioTap {
                 }
             }
         )
-        var tapOut: MTAudioProcessingTap?
-        let err = MTAudioProcessingTapCreate(kCFAllocatorDefault, &callbacks, kMTAudioProcessingTapCreationFlag_PostEffects, &tapOut)
-        guard err == noErr, let tap = tapOut else {
+        guard let tap = SSAudioTapCreate(&callbacks) else {
             Unmanaged<Context>.fromOpaque(callbacks.clientInfo!).release()
             return nil
         }

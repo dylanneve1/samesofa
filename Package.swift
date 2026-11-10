@@ -20,12 +20,15 @@ let package = Package(
             name: "CWebRTCAudioDevice",
             dependencies: ["WebRTC"]
         ),
+        // C wrapper for MTAudioProcessingTapCreate.
+        .target(name: "CAudioTap", linkerSettings: [.linkedFramework("MediaToolbox")]),
         // Calls, file transfer, playback and audio. Shared by the app and the integration test.
         .target(
             name: "SameSofaKit",
             dependencies: [
                 "SameSofaCore",
                 "CWebRTCAudioDevice",
+                "CAudioTap",
                 "WebRTC",
             ]
         ),
