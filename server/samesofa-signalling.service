@@ -1,0 +1,25 @@
+# Example systemd unit. Copy the server/ folder to /opt/samesofa-signalling,
+# run `npm ci --omit=dev` there, then:
+#   sudo cp samesofa-signalling.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now samesofa-signalling
+# Put a TLS-terminating reverse proxy (Caddy, nginx, ...) in front of it so the
+# app can reach it as wss://your-domain/.
+[Unit]
+Description=SameSofa signalling server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/samesofa-signalling
+ExecStart=/usr/bin/node server.js
+Environment=HOST=127.0.0.1
+Environment=PORT=8787
+Restart=on-failure
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

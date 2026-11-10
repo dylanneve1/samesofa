@@ -1,0 +1,16 @@
+{
+  "name": "samesofa-signalling",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tiny WebSocket room server that pairs two SameSofa apps and relays WebRTC signalling.",
+  "main": "server.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

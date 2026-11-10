@@ -1,0 +1,10 @@
+.build/
+build/
+dist/
+*.xcodeproj/
+.swiftpm/
+DerivedData/
+node_modules/
+.DS_Store
+TestFiles/
+Vendor/
