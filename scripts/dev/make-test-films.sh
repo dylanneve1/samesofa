@@ -3,7 +3,7 @@
 # Every clip has a white flash and a 1 kHz beep at t = 1, 4, 7, ... s over a
 # quiet 330 Hz tone, so audio/video sync can be measured after conversion.
 #
-# Needs a full FFmpeg with libx264, libx265, libvpx, libopus and libmp3lame
+# Needs a full FFmpeg with libx264, libx265, libvpx, libsvtav1, libopus and libmp3lame
 # (e.g. Homebrew's). That FFmpeg is only used to make test files; it is not
 # the LGPL helper that ships with the app.
 #
@@ -48,10 +48,13 @@ q -f lavfi -i "$(video 1280x720 24 $D)" -f lavfi -i "$(audio $D)" \
 # MKV, VP9 + Opus: both transcoded.
 q -f lavfi -i "$(video 1280x720 30 $D)" -f lavfi -i "$(audio $D)" \
   -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -b:v 2M -c:a libopus -b:a 128k vp9-opus.mkv
-# AVI, MPEG-4 ASP (Xvid-style, B-frames) + MP3: video transcoded, MP3 copied.
+# WebM, AV1 + Opus: both transcoded (AV1 decoded by dav1d).
+q -f lavfi -i "$(video 1280x720 24 $D)" -f lavfi -i "$(audio $D)" \
+  -c:v libsvtav1 -preset 10 -b:v 2M -svtav1-params lp=4 -c:a libopus -b:a 128k av1-opus.webm
+# AVI, MPEG-4 ASP (Xvid-style, B-frames) + MP3: both transcoded (AVPlayer won't play MP3 in MP4).
 q -f lavfi -i "$(video 720x400 25 $D)" -f lavfi -i "$(audio $D)" \
   -c:v mpeg4 -vtag XVID -q:v 4 -bf 2 -c:a libmp3lame -b:a 160k xvid-mp3.avi
-# AVI, H.264 (B-frames, no timestamps in AVI) + MP3, with a same-named .srt next to it.
+# AVI, H.264 (B-frames, no timestamps in AVI; video copied) + MP3, with a same-named .srt next to it.
 q -f lavfi -i "$(video 1280x720 24 $D)" -f lavfi -i "$(audio $D)" \
   -c:v libx264 -preset veryfast -b:v 2M -pix_fmt yuv420p -c:a libmp3lame -b:a 160k h264-mp3.avi
 cat > subs.srt <<'EOF'

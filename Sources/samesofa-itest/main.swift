@@ -33,6 +33,10 @@ if args["audio-check"] != nil {
 }
 
 // Conversion suite: MKV/AVI/... converted on the host, played in sync on the guest.
+if let list = args["convert-bench"] {
+    ConversionSuite(server: URL(string: "ws://unused")!, referenceFFmpeg: nil)
+        .benchmark(films: list.split(separator: ",").map { URL(fileURLWithPath: String($0)) })
+}
 if let list = args["convert-suite"], let server = args["server"].flatMap(URL.init(string:)) {
     let films = list.split(separator: ",").map { URL(fileURLWithPath: String($0)) }
     ConversionSuite(server: server, referenceFFmpeg: args["reference-ffmpeg"]).run(films: films)

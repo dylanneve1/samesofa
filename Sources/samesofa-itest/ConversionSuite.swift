@@ -28,6 +28,7 @@ final class ConversionSuite {
         "h264-aac.mkv": .init(remuxOnly: true),
         "hevc10-ac3.mkv": .init(remuxOnly: true),
         "vp9-opus.mkv": .init(remuxOnly: false, videoEncoded: true, audioEncoded: true),
+        "av1-opus.webm": .init(remuxOnly: false, videoEncoded: true, audioEncoded: true),
         "xvid-mp3.avi": .init(remuxOnly: false, videoEncoded: true, audioEncoded: true),
         "h264-mp3.avi": .init(remuxOnly: false, videoEncoded: false, audioEncoded: true, subtitles: true),
         "two-audio-srt.mkv": .init(remuxOnly: true, subtitles: true, audioStream: 2),
@@ -92,6 +93,45 @@ final class ConversionSuite {
             cancellation(transcode)
         }
         for film in films { runOne(film) }
+        log("TIMINGS")
+        timings.forEach { log("  " + $0) }
+        finish()
+    }
+
+    /// Conversion speed only (no peers): the app's own inspect + convert path.
+    func benchmark(films: [URL]) -> Never {
+        FilmPreparer.removeLeftovers()
+        for film in films {
+            guard case .success(let filmCheck)? = inspect(film), case .convert(let plan, let tools) = filmCheck else {
+                log("\(film.lastPathComponent): nothing to convert"); continue
+            }
+            log("\(film.lastPathComponent): \(plan.notes.joined(separator: "; "))")
+            let preparer = FilmPreparer(input: film, plan: plan, tools: tools)
+            var result: Result<URL, Error>?
+            var lastReport = Date()
+            preparer.onProgress = { fraction, speed in
+                if Date().timeIntervalSince(lastReport) > 10 {
+                    lastReport = Date()
+                    self.log(String(format: "  %.0f%% (%.1fx)", fraction * 100, speed ?? 0))
+                }
+            }
+            let t0 = Date()
+            preparer.start { result = $0 }
+            wait(3600) { result != nil }
+            let took = Date().timeIntervalSince(t0)
+            switch result {
+            case .success(let url)?:
+                let out = fileSize(url)
+                let line = String(format: "%@ (%.0f s of film, %.0f MB) -> %@ in %.1f s = %.1fx real time, %.0f MB",
+                                  film.lastPathComponent, plan.duration, Double(fileSize(film)) / 1e6,
+                                  plan.isRemuxOnly ? "remux" : "transcode", took, plan.duration / took, Double(out) / 1e6)
+                check("converted " + film.lastPathComponent, true, line)
+                timings.append(line)
+                preparer.discardOutput()
+            default:
+                check("converted " + film.lastPathComponent, false, "\(String(describing: result))")
+            }
+        }
         log("TIMINGS")
         timings.forEach { log("  " + $0) }
         finish()
