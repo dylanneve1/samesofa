@@ -19,17 +19,34 @@ var argv = CommandLine.arguments.dropFirst()
 while let key = argv.popFirst() {
     if key.hasPrefix("--") { args[String(key.dropFirst(2))] = argv.popFirst() ?? "" }
 }
-// Optional: start the real voice-processing audio engine at zero volume and
-// report whether it runs on this machine (it needs a microphone).
+// Optional: start the real call audio engine at zero volume and report
+// whether it runs on this machine, and what the sound output is.
 if args["audio-check"] != nil {
-    let hub = AudioHub(mode: .voiceProcessing)
-    hub.filmVolume = 0
+    let hub = AudioHub(mode: .live)
     hub.voiceVolume = 0
     hub.start()
     RunLoop.main.run(until: Date().addingTimeInterval(2))
-    print("voice processing: \(hub.voiceProcessingFailed ? "unavailable, fell back" : "active"); engine: \(hub.engineError ?? "running")")
+    let route = hub.outputRoute
+    print("call audio engine: \(hub.engineError ?? "running"); microphone: \(AVCaptureDevice.default(for: .audio) == nil ? "none" : "present")")
+    print("output: \(route.name) [\(route.transport.rawValue)\(route.dataSource.map { ", source \($0)" } ?? "")] -> \(route.kind.rawValue); film echo cancellation: \(hub.cancelsFilmEcho ? "on" : "off")")
     hub.stop()
     exit(0)
+}
+// Film sound path measurements and the echo canceller simulation (no sound is played).
+if let list = args["audio-measure"] {
+    FilmPathMeasure.run(files: list.split(separator: ",").map { URL(fileURLWithPath: String($0)) }, referenceFFmpeg: args["reference-ffmpeg"],
+                        seconds: Double(args["seconds"] ?? "5") ?? 5)
+}
+if let list = args["echo-sim"] {
+    let files = list.split(separator: ",").map { URL(fileURLWithPath: String($0)) }
+    guard files.count == 2 else { print("usage: --echo-sim film.wav,talker.wav [--dump directory]"); exit(2) }
+    EchoSim.run(filmURL: files[0], talkerURL: files[1], dump: args["dump"].map { URL(fileURLWithPath: $0) })
+}
+
+// Damaged video timestamps: detection, repair, fallback.
+if let directory = args["timestamp-suite"] {
+    TimestampSuite.run(workDirectory: URL(fileURLWithPath: directory), referenceFFmpeg: args["reference-ffmpeg"] ?? "/opt/homebrew/bin/ffmpeg",
+                       healthy: (args["healthy"] ?? "").split(separator: ",").map { URL(fileURLWithPath: String($0)) })
 }
 
 // Conversion suite: MKV/AVI/... converted on the host, played in sync on the guest.
@@ -124,7 +141,15 @@ func settings(_ label: String, hue: Double) -> PartySettings {
     PartySettings(serverURL: server, ice: IceSettings(stunURLs: []), audioMode: .synthetic, camera: .synthetic(label: label, hue: hue))
 }
 
-let host = Party(role: .host, settings: settings("Host", hue: 0.62))
+// --live-audio: the host uses the real call audio engine (silent: all volumes
+// at zero) instead of the synthetic one, to exercise it and its device-change handling.
+let liveAudio = args["live-audio"] != nil
+var hostSettings = settings("Host", hue: 0.62)
+if liveAudio { hostSettings.audioMode = .live }
+let host = Party(role: .host, settings: hostSettings)
+if liveAudio { host.filmVolume = 0; host.voiceVolume = 0 }
+let hostAudio = FilmPathMeasure.Capture()
+host.playback.filmAudioMonitor = hostAudio.monitor()
 let guest = Party(role: .guest, settings: settings("Guest", hue: 0.05))
 // Pretend the guest's clock is wildly different from the host's, as it would
 // be on two real machines; clock sync has to discover this.
@@ -161,7 +186,11 @@ guest.remoteVideoTrack?.add(guestFrames)
 spin(3)
 check("video host->guest", guestFrames.count > 10, "\(guestFrames.count) frames in 3 s")
 check("video guest->host", hostFrames.count > 10, "\(hostFrames.count) frames in 3 s")
-check("audio host->guest", guest.hub.receivedVoiceLevel > 0.02, String(format: "peak %.3f", guest.hub.receivedVoiceLevel))
+if liveAudio {
+    check("live call audio engine runs on the host", host.hub.engineError == nil, host.hub.engineError ?? "output: \(host.hub.outputRoute.name)")
+} else {
+    check("audio host->guest", guest.hub.receivedVoiceLevel > 0.02, String(format: "peak %.3f", guest.hub.receivedVoiceLevel))
+}
 check("audio guest->host", host.hub.receivedVoiceLevel > 0.02, String(format: "peak %.3f", host.hub.receivedVoiceLevel))
 
 // 3. Guest player becomes ready without having the file
@@ -217,6 +246,32 @@ guest.playback.play()
 spin(2)
 check("play from guest resumes host", host.playback.player.rate > 0)
 
+// 8b. Call and sound-path changes while the film plays must leave the film alone.
+spin(3)
+func offset(_ party: Party) -> Double { party.playback.currentTime - party.playback.engine.targetPosition(at: party.playback.sharedNow) }
+do {
+    let hostBefore = offset(host), guestBefore = offset(guest)
+    let hostRateChanges = host.playback.rateChangeCount, gaps = hostAudio.snapshot.discontinuities, restarts = host.hub.engineRestarts
+    host.micOn = false; spin(0.4); host.micOn = true
+    guest.micOn = false; spin(0.4); guest.micOn = true
+    host.hub.echoSetting = .headphones; spin(0.4)
+    host.hub.echoSetting = .speakers; spin(0.4)
+    host.hub.echoSetting = .automatic
+    if !liveAudio { host.filmVolume = 0.4; spin(0.3); host.filmVolume = 1 }
+    host.hub.simulateDeviceChange(); spin(0.5)
+    host.hub.stop(); spin(0.3); host.hub.start(); spin(1.5)
+    let hostMoved = abs(offset(host) - hostBefore), guestMoved = abs(offset(guest) - guestBefore)
+    check("mute, echo setting, volume and device changes leave the host's film alone",
+          host.playback.player.rate == 1 && host.playback.rateChangeCount == hostRateChanges && hostMoved < 0.042
+            && hostAudio.snapshot.discontinuities == gaps,
+          String(format: "rate %.3f, %d speed changes, position moved %.1f ms against the timeline, %d breaks in the sound, %d engine rebuilds",
+                 host.playback.player.rate, host.playback.rateChangeCount - hostRateChanges, hostMoved * 1000,
+                 hostAudio.snapshot.discontinuities - gaps, host.hub.engineRestarts - restarts))
+    check("the same changes leave the guest's film alone", abs(guest.playback.player.rate - 1) < 0.0101 && guestMoved < 0.042,
+          String(format: "rate %.3f, position moved %.1f ms against the timeline", guest.playback.player.rate, guestMoved * 1000))
+    if liveAudio { check("device change rebuilt the call audio engine", host.hub.engineRestarts > restarts && host.hub.engineError == nil) }
+}
+
 // 9. Disturbances: knock the guest's player off and watch it come back.
 func recovers(within seconds: Double) -> (Bool, Double) {
     let t0 = Date()
@@ -224,16 +279,40 @@ func recovers(within seconds: Double) -> (Bool, Double) {
     return (ok, Date().timeIntervalSince(t0))
 }
 spin(2)
+// (A seek on a playing player costs it a varying amount of time, so the size of the knock is measured, and repeated if it came out too small.)
+var knockedBy = 0.0
+for _ in 0..<4 {
+    var knockDone = false
+    guest.playback.player.seek(to: CMTime(seconds: guest.playback.currentTime + 0.3, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { _ in knockDone = true }
+    wait(3) { knockDone }
+    spin(0.1)
+    knockedBy = drift()
+    if knockedBy > 0.08 && knockedBy < 0.33 { break }
+    wait(30) { drift() < 0.03 && guest.playback.player.rate == 1 }
+}
+var largestNudge = 0.0
+let nudgeStart = Date()
+var ok = wait(40) {
+    if guest.playback.player.rate > 0 { largestNudge = max(largestNudge, abs(Double(guest.playback.player.rate) - 1)) }
+    return drift() < 0.03
+}
+var took = Date().timeIntervalSince(nudgeStart)
+check("small drift closed by a speed change of at most 1 %", knockedBy > 0.08 && ok && largestNudge > 0 && largestNudge <= 0.0101,
+      String(format: "knocked off by %.0f ms, within 30 ms after %.1f s, largest speed change %.2f %%", knockedBy * 1000, took, largestNudge * 100))
+check("speed back to exactly 1 once the gap is closed", wait(20) { guest.playback.player.rate == 1 } && host.playback.player.rate == 1,
+      String(format: "guest %.4f host %.4f", guest.playback.player.rate, host.playback.player.rate))
 guest.playback.player.seek(to: CMTime(seconds: guest.playback.currentTime + 0.7, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
 spin(0.3)
-var (ok, took) = recovers(within: 15)
-check("small drift (0.7 s) corrected smoothly", ok, String(format: "back within 0.1 s after %.1f s", took))
+(ok, took) = recovers(within: 8)
+check("medium drift (0.7 s) corrected by seeking", ok, String(format: "back within 0.1 s after %.1f s", took))
 host.playback.player.seek(to: CMTime(seconds: host.playback.currentTime - 4, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
 spin(0.3)
 (ok, took) = recovers(within: 8)
 check("large drift (4 s) corrected by seeking", ok, String(format: "back within 0.1 s after %.1f s", took))
 
 // 10. Soak: drift over time
+let soakHostNudges = host.playback.nudgeCount, soakGuestNudges = guest.playback.nudgeCount, soakReanchors = host.playback.reanchorCount
+var soakLargestNudge = 0.0
 var worst = 0.0, samples: [Double] = []
 let soakEnd = Date().addingTimeInterval(soakSeconds)
 var restarts = 0
@@ -246,6 +325,7 @@ while Date() < soakEnd {
         spin(2)
         continue
     }
+    for rate in [host.playback.player.rate, guest.playback.player.rate] where rate > 0 { soakLargestNudge = max(soakLargestNudge, abs(Double(rate) - 1)) }
     let d = drift()
     samples.append(d)
     worst = max(worst, d)
@@ -253,6 +333,13 @@ while Date() < soakEnd {
 let mean = samples.isEmpty ? 0 : samples.reduce(0, +) / Double(samples.count)
 check("drift stays under 0.25 s for \(Int(soakSeconds)) s", worst < 0.25,
       String(format: "max %.3f s, mean %.3f s, %d samples, %d wraps", worst, mean, samples.count, restarts))
+
+check("host never changes speed; guest nudges stay within 1 %", host.playback.nudgeCount == 0 && soakLargestNudge <= 0.0101,
+      String(format: "host nudges %d, host timeline moves %d, guest nudges %d, largest speed change %.2f %%",
+             host.playback.nudgeCount - soakHostNudges, host.playback.reanchorCount - soakReanchors,
+             guest.playback.nudgeCount - soakGuestNudges, soakLargestNudge * 100))
+check("each film's sound was set up exactly once", host.playback.audioSetupCount == 1 && guest.playback.audioSetupCount == 1,
+      "host \(host.playback.audioSetupCount), guest \(guest.playback.audioSetupCount)")
 
 // 11. Whole file arrives byte-exact
 host.playback.pause()

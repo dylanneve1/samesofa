@@ -172,12 +172,45 @@ final class SyncTests: XCTestCase {
         var engine = SyncEngine(role: .guest)
         engine.receive(Timeline(playing: true, position: 0, anchor: 0, seq: 1, origin: .host))
         XCTAssertEqual(engine.correction(actualPosition: 10.02, now: 10), .none(rate: 1))
-        guard case .adjustRate(let slower) = engine.correction(actualPosition: 10.3, now: 10) else { return XCTFail() }
+        guard case .adjustRate(let slower) = engine.correction(actualPosition: 10.2, now: 10) else { return XCTFail() }
         XCTAssertLessThan(slower, 1)
-        XCTAssertGreaterThanOrEqual(slower, 1 - engine.maxRateDelta)
-        guard case .adjustRate(let faster) = engine.correction(actualPosition: 9.7, now: 10) else { return XCTFail() }
+        XCTAssertGreaterThanOrEqual(slower, 0.99, "never more than 1 % off normal speed")
+        guard case .adjustRate(let faster) = engine.correction(actualPosition: 9.8, now: 10) else { return XCTFail() }
         XCTAssertGreaterThan(faster, 1)
+        XCTAssertLessThanOrEqual(faster, 1.01)
+        // A gap just over the deadband gets a gentler nudge than a big one.
+        guard case .adjustRate(let gentle) = engine.correction(actualPosition: 9.93, now: 10) else { return XCTFail() }
+        XCTAssertLessThan(gentle, faster)
+        XCTAssertGreaterThanOrEqual(gentle, 1 + engine.minRateDelta)
+        // Too far for a nudge of that size to be brief: seek.
+        XCTAssertEqual(engine.correction(actualPosition: 9.5, now: 10), .seek(to: 10))
         XCTAssertEqual(engine.correction(actualPosition: 5, now: 10), .seek(to: 10))
+    }
+
+    func testNudgeContinuesUntilSettled() {
+        var engine = SyncEngine(role: .guest)
+        engine.receive(Timeline(playing: true, position: 0, anchor: 0, seq: 1, origin: .host))
+        // 40 ms off: inside the deadband, so no nudge starts...
+        XCTAssertEqual(engine.correction(actualPosition: 10.04, now: 10), .none(rate: 1))
+        // ...but one that is under way carries on until the gap is really closed,
+        guard case .adjustRate = engine.correction(actualPosition: 10.04, now: 10, nudging: true) else { return XCTFail() }
+        // and then stops at exactly normal speed.
+        XCTAssertEqual(engine.correction(actualPosition: 10.01, now: 10, nudging: true), .none(rate: 1))
+    }
+
+    func testHostMovesTheTimelineInsteadOfChangingSpeed() {
+        var host = SyncEngine(role: .host)
+        _ = host.play(now: 0)
+        let before = host.timeline
+        // The host's player slipped 0.1 s behind.
+        let now = 20.0, actual = host.targetPosition(at: now) - 0.1
+        let moved = host.reanchor(now: now, actualPosition: actual)
+        XCTAssertTrue(moved.isNewer(than: before))
+        XCTAssertTrue(moved.playing)
+        XCTAssertEqual(host.correction(actualPosition: actual, now: now), .none(rate: 1))
+        XCTAssertEqual(host.targetPosition(at: now + 5), actual + 5, accuracy: 1e-9)
+        var guest = SyncEngine(role: .guest)
+        XCTAssertTrue(guest.receive(moved))
     }
 
     /// Simulates two players with slightly different clocks and speeds and
