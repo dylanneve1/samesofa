@@ -9,6 +9,11 @@ hear each other.
   timeline and correct themselves so they stay within a fraction of a second.
 - **Only one of you needs the file.** It is streamed to the other Mac directly
   (peer to peer) at original quality and decoded locally.
+- **MKV, AVI, WebM and friends work too.** MP4 and MOV are shared exactly as
+  they are; other films are turned into MP4 on the host's Mac first, usually by
+  just rewrapping them (seconds, no quality loss), otherwise by converting them
+  with the Mac's video encoder. Subtitles inside an MKV, or a `.srt` with the same
+  name next to the film, come along and can be switched on.
 - **Video call bubble** over the film: drag it anywhere, make it bigger or
   smaller, hide it. Mute and camera-off buttons. Controls fade away while the
   film plays.
@@ -23,6 +28,12 @@ hear each other.
 |---|---|
 | ![Welcome](docs/screenshots/welcome.png) | ![Typing the code](docs/screenshots/join.png) |
 | ![The host's code](docs/screenshots/host-waiting.png) | ![Playing, controls hidden](docs/screenshots/playing.png) |
+
+| | |
+|---|---|
+| ![Preparing an MKV while the code is shown](docs/screenshots/preparing.png) | ![The guest sees the host's progress](docs/screenshots/guest-preparing.png) |
+
+![A converted MKV playing with its subtitles](docs/screenshots/playing-subtitles.png)
 
 *(Screenshots use a generated test film and a generated stand-in camera
 picture.)*
@@ -68,26 +79,41 @@ picture.)*
 
 ## What files work
 
-SameSofa plays whatever macOS itself (AVFoundation) can play:
+The host picks (or drops) a film; the guest needs nothing but the app.
 
-| Works | Doesn't (yet) |
+- **MP4, M4V, MOV** that macOS plays are shared byte for byte, as before.
+- **MKV, WebM, AVI, MPEG-TS (`.ts`, `.m2ts`), FLV, WMV/ASF, MPEG-PS (`.mpg`,
+  `.vob`), Ogg, 3GP, RealMedia** and MP4/MOV files macOS can't play are first
+  turned into an MP4 on the host's Mac ("Preparing film… 43%"). The room and
+  its code are there straight away; your partner can join while it runs.
+
+Each stream is handled on its own:
+
+| Rewrapped (copied, seconds, no quality change) | Converted (re-encoded on the host) |
 |---|---|
-| `.mp4`, `.m4v`, `.mov` with H.264 or HEVC (H.265) video | `.mkv`, `.webm`, `.avi`, `.flv`, `.wmv` containers |
-| AAC, ALAC, MP3, AC-3 / E-AC-3 (Dolby Digital) audio | DTS audio, VP9/AV1 inside MKV/WebM |
-| Files whose index (`moov`) is at the end are fine | Separate subtitle files (`.srt`) and subtitles inside MKV |
+| Video: H.264 (8-bit 4:2:0), HEVC/H.265 Main and Main 10 | Video: MPEG-4 ASP (Xvid, DivX), VP8, VP9, AV1, MPEG-2, MPEG-1, VC-1/WMV, H.263, Theora, MJPEG, H.264 High 10/4:2:2/4:4:4, and anything else FFmpeg reads → H.264, or HEVC for 10-bit/HDR and above 1080p, with the Mac's VideoToolbox encoder at the same size and frame rate |
+| Audio: AAC, AC-3, E-AC-3 (Dolby Digital/Plus), ALAC | Audio: MP3, DTS, Opus, Vorbis, FLAC, TrueHD, PCM, MP2, WMA, … → AAC (stereo 192 kbit/s, 5.1 384 kbit/s; 7.1 is mixed to 5.1) |
+| Subtitles: the first text track (SRT, ASS/SSA, WebVTT) or a same-named `.srt`, as an MP4 text track | |
 
-The host is told straight away if a file can't be played.
+Measured on a 2020 Mac mini (M1, 16 GB) with 10-minute 1080p24 test films:
 
-**MKV today:** most MKV files hold H.264/HEVC + AAC/AC-3 and can be rewrapped
-into MP4 in seconds without re-encoding: `ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c copy film.mp4`.
+| Film | Path | Time | Speed |
+|---|---|---|---|
+| MKV, H.264 8 Mbit/s + AAC (607 MB) | rewrap | 1.3 s | 456× real time |
+| AVI, Xvid 1080p + MP3 (1.06 GB) | convert video and audio | 70 s | 8.5× real time |
+| WebM, VP9 + Opus (330 MB) | convert video and audio | 71 s | 8.5× real time |
 
-**MKV later, in the app:** the transfer layer already moves arbitrary bytes, so
-only the host's player needs to understand MKV. Options, roughly in order of
-effort: (1) remux on the host before sharing, using a bundled `ffmpeg`/libavformat
-built as LGPL and loaded dynamically (keep it out of the MIT binary, ship its
-source/licence); (2) write a small Matroska demuxer in Swift that feeds
-`AVSampleBufferDisplayLayer` / `AVSampleBufferAudioRenderer` and keep the same
-sync engine; (3) VLCKit (LGPL) as an alternative player for unsupported files.
+Both conversions are limited by the hardware H.264 encoder (about 200 frames
+a second at 1080p on an M1); the rewrap figure had the film in the disk cache
+(from a cold SSD, expect a few seconds per GB). So a two-hour MKV that only
+needs rewrapping is ready in well under a minute, and a two-hour 1080p film that needs converting takes
+roughly 14 minutes on an M1 (faster on newer Macs, slower on Intel Macs
+without a recent hardware encoder).
+
+Only the default (or first) video and audio track are kept, to keep the
+transfer small. What doesn't work: picture-based subtitles (Blu-ray PGS, DVD
+VobSub), DRM-protected files, and files FFmpeg itself can't read. The host is
+told straight away if a film can't be used.
 
 ---
 
@@ -120,7 +146,7 @@ and the guest plays it from a local sparse file through
   waiting for jump the queue on both sides; next come the last chunks of the
   file (MP4 files often keep their index at the end, so this makes them
   startable quickly), then everything from the playhead forwards, then the rest;
-- the host never lets more than ~2 MB queue up inside WebRTC
+- the host never lets more than ~1 MB queue up inside WebRTC
   (`bufferedAmount` backpressure) so a seek redirects the transfer quickly;
 - playback starts once about 8 seconds ahead are available. If the guest runs
   dry, **both** sides pause ("Waiting for your partner to catch up…") and the
@@ -133,6 +159,52 @@ and the guest plays it from a local sparse file through
 Re-encoding into a WebRTC video track would have been simpler to start but
 loses quality, costs CPU on the host for the whole film, and makes the call and
 the film fight over one congestion controller. It was not needed.
+
+### Films macOS can't play: converted on the host, then shared
+
+AVPlayer only understands MP4/MOV with a handful of codecs. Rather than
+replacing the player, SameSofa makes the film fit it, on the host's Mac,
+before sharing:
+
+1. **Look.** The host's Mac asks AVFoundation whether it can play the file and
+   runs the bundled `ffprobe` on it. A playable MP4/MOV is shared untouched.
+2. **Decide, stream by stream** (`MediaPlanner` in `SameSofaCore`, unit
+   tested): copy every stream AVPlayer can decode from an MP4 and re-encode only
+   the rest (tables above). The default video and audio tracks are picked,
+   cover art is skipped, HEVC is labelled `hvc1` (what AVFoundation wants), AVI
+   timestamps are regenerated, interlaced video is deinterlaced when it has to
+   be re-encoded anyway, 10-bit/HDR stays 10-bit (HEVC Main 10).
+3. **Convert** with the bundled `ffmpeg` into a temporary MP4. Video is encoded
+   by the Mac's own VideoToolbox (hardware) encoder at the source's size and
+   frame rate with a keyframe every 2 seconds (so seeks stay quick for the sync
+   engine), audio by FFmpeg's AAC encoder. The app shows real progress (from
+   `ffmpeg -progress`) and a Cancel button; the room is already open and the
+   guest sees "Your partner's Mac is preparing the film… 43%".
+4. **Share** the MP4 exactly like any other MP4: same transfer, same sync,
+   same echo-cancelled audio path. The temporary file is deleted when the
+   session ends or the app quits, and leftovers from a crash at the next launch.
+
+Why this way round: the transfer, the sync engine and the echo cancellation
+(which takes the film's sound out of AVPlayer with an audio tap) all build on
+AVPlayer. Playing MKV directly with VLCKit or libmpv on both Macs would have
+meant a second sync implementation (their clocks, seeking and rate control
+behave differently), a second way to get the film's audio into the voice
+processing engine, a much larger LGPL/GPL dependency on both sides, and the
+guest would need it too. Converting on the host keeps the guest's side
+unchanged and costs seconds for the common case (MKV with H.264/HEVC + AAC/AC-3
+just gets rewrapped). The price is a wait before sharing when a film has to be
+re-encoded, and some loss of quality in that case (generous bit rates keep it
+small).
+
+Converting while already sharing (fragmented MP4, guest starting before the
+host is done) was left out: the guest's transfer is built around a file whose
+size is known up front and whose index can be fetched first, and a rewrap is
+fast enough that it doesn't matter. For re-encodes it would be the next step.
+
+FFmpeg runs as separate helper programs (`Contents/Helpers/ffmpeg`,
+`ffprobe`) with their own LGPL shared libraries, built by
+`scripts/build-ffmpeg.sh`; nothing from FFmpeg is linked into SameSofa itself.
+See *Third-party software* below.
 
 ### Staying in sync
 
@@ -303,8 +375,9 @@ SAMESOFA_SERVER_URL=wss://sofa.example.org scripts/build.sh   # bake in your ser
 ```
 
 `scripts/build.sh` downloads WebRTC (checksum verified) into `Vendor/`, builds
-with SwiftPM, assembles `build/SameSofa.app` (Info.plist with camera and
-microphone usage strings, WebRTC.framework embedded) and signs it:
+the FFmpeg helper (below), builds with SwiftPM, assembles `build/SameSofa.app`
+(Info.plist with camera and microphone usage strings, WebRTC.framework and the
+FFmpeg helper embedded) and signs it:
 
 - with `SAMESOFA_SIGN_IDENTITY="Developer ID Application: …"` it signs with the
   hardened runtime and `Resources/SameSofa.entitlements` (camera, audio input).
@@ -312,6 +385,14 @@ microphone usage strings, WebRTC.framework embedded) and signs it:
   Apple Developer account, which removes the "Open Anyway" step;
 - otherwise it **ad-hoc** signs (fine for personal use, needs the Gatekeeper
   step above).
+
+**The FFmpeg helper.** `scripts/build-ffmpeg.sh` (run by `build.sh`) downloads
+FFmpeg 8.1.3 and dav1d 1.5.4 (pinned, SHA-256 checked), and builds them for
+arm64 and x86_64 into `Vendor/FFmpeg` (a few minutes, once; it is rebuilt only
+when the script changes). It needs `brew install nasm meson ninja pkg-config`.
+The configuration is LGPL only (no `--enable-gpl`/`--enable-nonfree`, no
+x264/x265) and the script fails if that ever changes. `SAMESOFA_NO_FFMPEG=1
+scripts/build.sh` leaves the helper out; that build can only host MP4/MOV.
 
 ### Tests
 
@@ -341,10 +422,33 @@ received file being byte-identical (SHA-256), and leaving/rejoining. The
 `--throttle` run caps the host's upload below the film's bitrate and checks that
 both sides pause when the guest runs dry and resume together.
 
-`.github/workflows/ci.yml` runs the server tests, the unit tests and an
-Apple-silicon app build on GitHub's macOS runners. It is manual-only for now
-(see the comment in the file); switch it to run on push once the repository is
-public.
+Conversion end-to-end test: generate the synthetic test films (each has a
+white flash and a beep at 1, 4, 7, … s), then run every one through the host's
+conversion, the transfer and synced playback:
+
+```sh
+scripts/dev/make-test-films.sh /tmp/films        # needs a full ffmpeg (e.g. Homebrew's) to *make* the films
+T=/tmp/films
+.build/debug/samesofa-itest --server ws://127.0.0.1:18787 --reference-ffmpeg "$(which ffmpeg)" \
+  --convert-suite $T/h264-aac.mkv,$T/hevc10-ac3.mkv,$T/vp9-opus.mkv,$T/av1-opus.webm,$T/xvid-mp3.avi,$T/h264-mp3.avi,$T/two-audio-srt.mkv
+.build/debug/samesofa-itest --convert-bench film1.mkv,film2.avi   # conversion speed only
+```
+
+For each film it checks the remux/transcode decision, that the code is shown
+while the film is still being prepared, play/pause/seek from both sides with
+drift under 0.25 s, that the film's sound reaches both audio engines, that the
+guest's copy is byte-identical to the converted film, subtitles (on both sides,
+toggling), and, decoding the guest's copy with AVFoundation, that every flash
+and beep is where FFmpeg puts it in the source (within 5 ms for the picture and
+12 ms for sound; AVI within a frame, see below) and that audio/video sync is
+unchanged. It also cancels a running conversion and checks the partial file is
+removed.
+
+`.github/workflows/ci.yml` runs the server tests, the unit tests, the FFmpeg
+helper build (cached, with an LGPL-only check) and an Apple-silicon app build
+on GitHub's macOS runners. It is manual-only at the moment because GitHub
+Actions isn't available for the account; the comment in the file shows how to
+switch it back to running on every push.
 
 `.build/debug/samesofa-itest --audio-check` starts the real voice-processing
 audio engine at zero volume and reports whether it runs on that Mac.
@@ -352,13 +456,13 @@ audio engine at zero volume and reports whether it runs on that Mac.
 ### Layout
 
 ```
-Sources/SameSofaCore      protocol messages, sync engine, clock sync, chunk map/scheduler (pure Swift, unit tested)
-Sources/SameSofaKit       WebRTC call, data channels, file sender/receiver, playback controller, audio engine
+Sources/SameSofaCore      protocol messages, sync engine, clock sync, chunk map/scheduler, film conversion planner (pure Swift, unit tested)
+Sources/SameSofaKit       WebRTC call, data channels, file sender/receiver, playback controller, audio engine, FFmpeg helper runner
 Sources/SameSofa          the SwiftUI app
 Sources/samesofa-itest    end-to-end test runner
 Sources/CWebRTCAudioDevice, CAudioTap   small C/Objective-C headers and shims
 server/                   room server (Node + ws), tests, Dockerfile, systemd unit
-scripts/                  build.sh, fetch-webrtc.sh, make-icon.swift
+scripts/                  build.sh, fetch-webrtc.sh, build-ffmpeg.sh, make-icon.swift; dev/ test-film and screenshot helpers
 ```
 
 ---
@@ -380,6 +484,18 @@ scripts/                  build.sh, fetch-webrtc.sh, make-icon.swift
   re-downloads the film into a new temporary file.
 - The guest needs free disk space roughly the size of the film.
 - One film per session; to switch films, leave and host again.
+- Converting (not just rewrapping) a film takes minutes and the guest can't
+  start before it's done. Re-encoded video loses a little quality.
+- Only one audio track and one subtitle track are carried; picture-based
+  subtitles (PGS, VobSub) are dropped. Subtitles are on/off per person.
+- AVI can't store presentation times. With B-frames, players disagree by up to
+  a frame about where the picture belongs; SameSofa's result was within one
+  frame (≈ 40 ms) of FFmpeg's reading in the tests, and closer to the true
+  timing than FFmpeg's own playback of the test AVIs.
+- The conversion was tested on Apple silicon (M1) only. The x86_64 half of the
+  FFmpeg helper is built but hasn't been run on an Intel Mac.
+- Real-world MKV/AVI files (odd muxers, broken indexes, variable frame rate,
+  very long films) were not available; the tests use generated films.
 
 ---
 
@@ -389,11 +505,25 @@ scripts/                  build.sh, fetch-webrtc.sh, make-icon.swift
 |---|---|---|
 | [WebRTC](https://webrtc.org) M157, prebuilt by [stasel/WebRTC](https://github.com/stasel/WebRTC) | BSD-3-Clause (+ WebRTC patent grant) | calls, data channels (embedded `WebRTC.framework`) |
 | `RTCAudioDevice.h` copied from WebRTC | BSD-3-Clause | custom audio device protocol |
+| [FFmpeg](https://ffmpeg.org) 8.1.3 | LGPL-2.1-or-later | converting MKV/AVI/… on the host (separate helper programs) |
+| [dav1d](https://code.videolan.org/videolan/dav1d) 1.5.4 | BSD-2-Clause | AV1 decoding, inside the FFmpeg helper |
 | [ws](https://github.com/websockets/ws) | MIT | room server WebSocket |
 | Apple SF Symbols | Apple's terms, via the system | icons in the app |
 
 The full notices are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), which
 is also copied into the app (SameSofa ▸ Acknowledgements…).
+
+**FFmpeg (LGPL-2.1-or-later).** The app bundles FFmpeg 8.1.3, unmodified, as
+separate helper programs (`Contents/Helpers/ffmpeg`, `ffprobe`) and shared
+libraries (`Contents/Frameworks/libav*.dylib`, `libsw*.dylib`); SameSofa runs
+them as processes and links none of it. Built by `scripts/build-ffmpeg.sh` from
+https://ffmpeg.org/releases/ffmpeg-8.1.3.tar.xz (SHA-256 checked) with
+`--disable-gpl --disable-nonfree --disable-version3`, VideoToolbox/AudioToolbox,
+dav1d (BSD-2-Clause) for AV1, and only the encoders, muxers and filters
+SameSofa needs; the full flags are in THIRD-PARTY-NOTICES.md and in the app at
+`Contents/Resources/FFmpeg/BUILDINFO.txt`, next to the LGPL text
+(`COPYING.LGPLv2.1`). You can replace the helper with your own FFmpeg build
+(same file names and places, then re-sign the app).
 
 ## Disclaimer
 
