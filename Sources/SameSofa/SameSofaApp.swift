@@ -56,6 +56,7 @@ struct RootView: View {
                 }
             }
         }
+        .ignoresSafeArea()
         .animation(.easeInOut(duration: 0.25), value: model.screen)
     }
 }

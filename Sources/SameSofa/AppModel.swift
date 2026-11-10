@@ -56,6 +56,13 @@ struct LaunchOptions {
     var synthetic = false
     var label = "Me"
     var autoPlay = false
+    /// Screenshots only: open on a given screen with a partly typed code.
+    var screen: String?
+    var prefill: String?
+    /// Self-test: deliver these key presses to the join screen through the
+    /// window (not the system), and record what code the app tried to join.
+    var typeTest: String?
+    var typeTestOutput: URL?
 
     init() {
         var args = ArraySlice(CommandLine.arguments.dropFirst())
@@ -68,6 +75,10 @@ struct LaunchOptions {
             case "--synthetic": synthetic = true
             case "--label": label = args.popFirst() ?? label
             case "--autoplay": autoPlay = true
+            case "--screen": screen = args.popFirst()
+            case "--prefill": prefill = args.popFirst()
+            case "--type-test": typeTest = args.popFirst()
+            case "--type-test-output": typeTestOutput = args.popFirst().map { URL(fileURLWithPath: $0) }
             default: break
             }
         }
@@ -95,6 +106,8 @@ final class AppModel: ObservableObject {
     private func runLaunchOptions() {
         if let film = options.hostFilm { startHosting(film: film) }
         if let code = options.joinCode { join(code: code) }
+        if options.screen == "join" { screen = .join }
+        if let text = options.typeTest { runTypeTest(text) }
     }
 
     private func partySettings() -> PartySettings? {
@@ -142,6 +155,7 @@ final class AppModel: ObservableObject {
     }
 
     func join(code: String) {
+        if let out = options.typeTestOutput { try? "join:\(code)".write(to: out, atomically: true, encoding: .utf8) }
         guard let ps = partySettings() else { return }
         notice = nil
         Task { @MainActor in
@@ -177,11 +191,32 @@ final class AppModel: ObservableObject {
     }
 
     func handleEnded(_ message: String) {
+        // A guest whose code didn't work goes straight back to typing it.
+        let retryJoin = party?.role == .guest && !(party?.wasTogether ?? false) && !message.isEmpty
         party?.leave()
         party = nil
         cancellables.removeAll()
         notice = message.isEmpty ? nil : message
-        screen = .welcome
+        screen = retryJoin ? .join : .welcome
+    }
+
+    private func runTypeTest(_ text: String) {
+        screen = .join
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard let window = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil }) else { return }
+            var delay = 0.0
+            for ch in text {
+                delay += 0.15
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    let keyCode: UInt16 = ch == "-" ? 27 : 0
+                    if let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                                    windowNumber: window.windowNumber, context: nil, characters: String(ch),
+                                                    charactersIgnoringModifiers: String(ch), isARepeat: false, keyCode: keyCode) {
+                        window.sendEvent(event)
+                    }
+                }
+            }
+        }
     }
 
     static func requestPermissions(synthetic: Bool) async {

@@ -16,7 +16,7 @@ struct PartyView: View {
     @State private var dragStart: CGSize?
     @State private var scrubbing: Double?
     @State private var keyMonitor: Any?
-    private let hideTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+    @State private var lastPointer: CGPoint?
 
     var body: some View {
         GeometryReader { geo in
@@ -43,12 +43,24 @@ struct PartyView: View {
 
                 CursorHider(hidden: !showChrome).frame(width: 0, height: 0)
             }
-            .onContinuousHover { _ in poke() }
+            .onContinuousHover { phase in
+                // Only real pointer movement counts; SwiftUI also reports hover on re-render.
+                if case .active(let point) = phase {
+                    if let last = lastPointer, abs(last.x - point.x) + abs(last.y - point.y) < 3 { return }
+                    lastPointer = point
+                    poke()
+                }
+            }
         }
         .ignoresSafeArea()
-        .onReceive(hideTimer) { _ in
-            if playback.intendsToPlay, !playback.isHeld, Date().timeIntervalSince(lastActivity) > 3, scrubbing == nil {
-                controlsVisible = false
+        .task {
+            // Auto-hide the controls during playback after 3 s without mouse movement.
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+                if controlsVisible, playback.intendsToPlay, !playback.isHeld,
+                   Date().timeIntervalSince(lastActivity) > 3, scrubbing == nil {
+                    controlsVisible = false
+                }
             }
         }
         .onChange(of: party.phase) { _, phase in
@@ -121,6 +133,12 @@ struct PartyView: View {
                 .lineLimit(1)
                 .shadow(radius: 4)
             Spacer()
+            if party.hub.mode == .voiceProcessing, party.hub.voiceProcessingFailed {
+                Label("Echo cancellation isn't available on this Mac. Headphones recommended.", systemImage: "headphones")
+                    .font(.callout).foregroundStyle(.white.opacity(0.75))
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(Capsule().fill(.black.opacity(0.45)))
+            }
             if party.phase == .together, party.role == .host, party.transferFraction < 1 {
                 Text("Sending the film: \(Int(party.transferFraction * 100))%")
                     .font(.callout).foregroundStyle(.white.opacity(0.75))

@@ -34,7 +34,11 @@ public final class Party: ObservableObject {
         case ended(String)
     }
 
-    @Published public private(set) var phase: Phase = .idle
+    @Published public private(set) var phase: Phase = .idle {
+        didSet { if phase == .together { wasTogether = true } }
+    }
+    /// The two of them were connected at some point.
+    public private(set) var wasTogether = false
     @Published public private(set) var remoteVideoTrack: RTCVideoTrack?
     @Published public private(set) var localVideoTrack: RTCVideoTrack?
     @Published public private(set) var filmName: String?
