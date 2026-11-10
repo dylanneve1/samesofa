@@ -1,11 +1,22 @@
 import AppKit
 import AVFoundation
+import SameSofaCore
 import SwiftUI
 import WebRTC
 
 /// The film. A plain AVPlayerLayer: SameSofa draws its own controls.
+///
+/// The layer is opaque, pixel-aligned and at the display's own scale, so the
+/// system scales the picture once, at full quality and bit depth (10-bit and
+/// HDR are handled by AVPlayerLayer itself). While the film plays, a display
+/// link asks a variable-refresh display (ProMotion, adaptive sync) to refresh
+/// at a whole multiple of the film's frame rate, so every frame is shown for
+/// the same time; on a display with a fixed refresh rate this has no effect.
 struct PlayerSurface: NSViewRepresentable {
     let player: AVPlayer
+    var frameRate: Double = 0
+    var playing = false
+    var matchFrameRate = true
 
     func makeNSView(context: Context) -> PlayerNSView {
         let view = PlayerNSView()
@@ -15,26 +26,73 @@ struct PlayerSurface: NSViewRepresentable {
 
     func updateNSView(_ view: PlayerNSView, context: Context) {
         if view.playerLayer.player !== player { view.playerLayer.player = player }
+        view.setPacing(frameRate: matchFrameRate && playing ? frameRate : 0)
+    }
+
+    static func dismantleNSView(_ view: PlayerNSView, coordinator: ()) {
+        view.setPacing(frameRate: 0)
     }
 
     final class PlayerNSView: NSView {
         let playerLayer = AVPlayerLayer()
+        private var displayLink: CADisplayLink?
+        private var pacedFrameRate = 0.0
+        /// What the display link was last asked for (Hz), for the quality readout.
+        private(set) var requestedRefreshRate: Double?
+
         override init(frame: NSRect) {
             super.init(frame: frame)
             wantsLayer = true
             layer = CALayer()
             layer?.backgroundColor = NSColor.black.cgColor
+            layer?.isOpaque = true
             playerLayer.videoGravity = .resizeAspect
+            playerLayer.isOpaque = true
+            playerLayer.backgroundColor = NSColor.black.cgColor
             layer?.addSublayer(playerLayer)
         }
         required init?(coder: NSCoder) { fatalError() }
+
         override func layout() {
             super.layout()
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            playerLayer.frame = bounds
+            // Whole device pixels, at the screen's scale: no blurry half-pixel edges.
+            playerLayer.frame = backingAlignedRect(bounds, options: .alignAllEdgesNearest)
+            playerLayer.contentsScale = window?.backingScaleFactor ?? 2
             CATransaction.commit()
         }
+
+        override func viewDidChangeBackingProperties() {
+            super.viewDidChangeBackingProperties()
+            needsLayout = true
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            let rate = pacedFrameRate
+            pacedFrameRate = 0
+            setPacing(frameRate: rate)
+        }
+
+        /// `frameRate` 0: no preference (paused, or matching switched off).
+        func setPacing(frameRate: Double) {
+            guard frameRate != pacedFrameRate || (frameRate > 0 && displayLink == nil) else { return }
+            pacedFrameRate = frameRate
+            displayLink?.invalidate()
+            displayLink = nil
+            requestedRefreshRate = nil
+            guard frameRate >= 1, let screen = window?.screen,
+                  let refresh = FrameRateMatch.preferredRefreshRate(filmFrameRate: frameRate, displayMaximum: Double(screen.maximumFramesPerSecond)) else { return }
+            let link = displayLink(target: self, selector: #selector(refreshed(_:)))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: Float(refresh), maximum: Float(refresh), preferred: Float(refresh))
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+            requestedRefreshRate = refresh
+        }
+
+        /// Nothing to draw: the link only tells the system which refresh rate suits the film.
+        @objc private func refreshed(_ link: CADisplayLink) {}
     }
 }
 

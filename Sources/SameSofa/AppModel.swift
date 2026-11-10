@@ -21,7 +21,14 @@ final class AppSettings: ObservableObject {
     @Published var turnURL: String { didSet { defaults.set(turnURL, forKey: "turnURL") } }
     @Published var turnUsername: String { didSet { defaults.set(turnUsername, forKey: "turnUsername") } }
     @Published var turnCredential: String { didSet { defaults.set(turnCredential, forKey: "turnCredential") } }
-    @Published var headphonesMode: Bool { didSet { defaults.set(headphonesMode, forKey: "headphonesMode") } }
+    /// "automatic", "headphones" (on) or "speakers" (off): see EchoSetting.
+    @Published var soundOutput: String { didSet { defaults.set(soundOutput, forKey: "soundOutput") } }
+    /// Leave spatial audio (Dolby Atmos, AirPods) to the system instead of a plain downmix.
+    @Published var systemSpatialAudio: Bool { didSet { defaults.set(systemSpatialAudio, forKey: "systemSpatialAudio") } }
+    /// Ask variable-refresh displays to follow the film's frame rate.
+    @Published var matchFrameRate: Bool { didSet { defaults.set(matchFrameRate, forKey: "matchFrameRate") } }
+
+    var echoSetting: EchoSetting { EchoSetting(rawValue: soundOutput) ?? .automatic }
 
     init() {
         serverURL = defaults.string(forKey: "serverURL") ?? AppSettings.builtInServer
@@ -29,7 +36,9 @@ final class AppSettings: ObservableObject {
         turnURL = defaults.string(forKey: "turnURL") ?? ""
         turnUsername = defaults.string(forKey: "turnUsername") ?? ""
         turnCredential = defaults.string(forKey: "turnCredential") ?? ""
-        headphonesMode = defaults.bool(forKey: "headphonesMode")
+        soundOutput = defaults.string(forKey: "soundOutput") ?? EchoSetting.automatic.rawValue
+        systemSpatialAudio = defaults.bool(forKey: "systemSpatialAudio")
+        matchFrameRate = defaults.object(forKey: "matchFrameRate") as? Bool ?? true
         // A command-line override is handy for testing two copies on one Mac.
         if let override = LaunchOptions.shared.server { serverURL = override }
     }
@@ -57,10 +66,14 @@ struct LaunchOptions {
     var synthetic = false
     var label = "Me"
     var autoPlay = false
+    /// Screenshots only: the host starts the film before anyone has joined.
+    var playAlone = false
     /// Turn subtitles on as soon as the film has them.
     var subtitles = false
     /// Screenshots only: open on a given screen with a partly typed code.
     var screen: String?
+    /// Screenshots only: open "quality", "acknowledgements", "about", "shortcuts" or "settings" without a click.
+    var show: String?
     var prefill: String?
     /// Self-test: deliver these key presses to the join screen through the
     /// window (not the system), and record what code the app tried to join.
@@ -78,8 +91,10 @@ struct LaunchOptions {
             case "--synthetic": synthetic = true
             case "--label": label = args.popFirst() ?? label
             case "--autoplay": autoPlay = true
+            case "--play-alone": playAlone = true
             case "--subtitles": subtitles = true
             case "--screen": screen = args.popFirst()
+            case "--show": show = args.popFirst()
             case "--prefill": prefill = args.popFirst()
             case "--type-test": typeTest = args.popFirst()
             case "--type-test-output": typeTestOutput = args.popFirst().map { URL(fileURLWithPath: $0) }
@@ -114,6 +129,10 @@ final class AppModel: ObservableObject {
             self?.party?.leave()
             FilmPreparer.removeLeftovers()
         }
+        // The headphones setting applies straight away, also in the middle of a film.
+        settings.$soundOutput.sink { [weak self] value in
+            self?.party?.hub.echoSetting = EchoSetting(rawValue: value) ?? .automatic
+        }.store(in: &cancellables)
         DispatchQueue.main.async { self.runLaunchOptions() }
     }
 
@@ -135,9 +154,11 @@ final class AppModel: ObservableObject {
             return nil
         }
         let synthetic = options.synthetic
-        return PartySettings(serverURL: url, ice: settings.ice,
-                             audioMode: synthetic ? .synthetic : (settings.headphonesMode ? .headphones : .voiceProcessing),
+        var party = PartySettings(serverURL: url, ice: settings.ice,
+                             audioMode: synthetic ? .synthetic : .live, echo: settings.echoSetting,
                              camera: synthetic ? .synthetic(label: options.label, hue: options.joinCode == nil ? 0.62 : 0.05) : .camera)
+        party.systemSpatialAudio = settings.systemSpatialAudio
+        return party
     }
 
     func chooseFilmAndHost() {
@@ -198,6 +219,9 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             if case .waitingForPartner(let code) = phase, let file = self.options.codeFile {
                 try? code.write(to: file, atomically: true, encoding: .utf8)
+            }
+            if case .waitingForPartner = phase, self.options.playAlone, party.role == .host {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { if !party.playback.intendsToPlay { party.playback.play() } }
             }
             if phase == .together, self.options.autoPlay, party.role == .host {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4) { party.playback.play() }

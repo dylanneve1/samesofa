@@ -7,6 +7,8 @@ struct PartyView: View {
     @EnvironmentObject var model: AppModel
     @ObservedObject var party: Party
     @ObservedObject var playback: PlaybackController
+    @EnvironmentObject var settings: AppSettings
+    @State private var showQuality = LaunchOptions.shared.show == "quality"
 
     @State private var controlsVisible = true
     @State private var lastActivity = Date()
@@ -22,7 +24,8 @@ struct PartyView: View {
         GeometryReader { geo in
             ZStack {
                 Color.black
-                PlayerSurface(player: playback.player)
+                PlayerSurface(player: playback.player, frameRate: playback.frameRate,
+                              playing: playback.intendsToPlay && !playback.isHeld, matchFrameRate: settings.matchFrameRate)
                     .opacity(playback.isLoaded ? 1 : 0)
                     .onTapGesture(count: 2) { toggleFullScreen() }
                     .onTapGesture { if party.phase == .together { playback.togglePlay() } }
@@ -70,7 +73,7 @@ struct PartyView: View {
         .onDisappear { removeKeys() }
     }
 
-    private var showChrome: Bool { controlsVisible || !playback.intendsToPlay || party.phase != .together }
+    private var showChrome: Bool { controlsVisible || !playback.intendsToPlay || showQuality }
 
     private func poke() {
         lastActivity = Date()
@@ -87,7 +90,11 @@ struct PartyView: View {
                 Text(party.role == .host ? "Opening a room…" : "Finding your partner…").font(.title2)
             }
         case .waitingForPartner(let code):
-            WaitingForPartnerCard(code: code, filmName: party.filmName, preparing: party.preparing) { model.leaveParty() }
+            // While the host watches alone, the picture stays clear: the code
+            // moves to a chip in the top bar and the card returns on pause.
+            if !playback.intendsToPlay || party.preparing != nil {
+                WaitingForPartnerCard(code: code, filmName: party.filmName, preparing: party.preparing) { model.leaveParty() }
+            }
         case .connecting:
             StatusCard {
                 ProgressView().controlSize(.large)
@@ -138,17 +145,13 @@ struct PartyView: View {
             }
             .buttonStyle(CircleButtonStyle())
             .help("Leave")
+            .accessibilityLabel("Leave")
             Text(party.filmName ?? "")
                 .font(.system(size: 15, weight: .semibold))
                 .lineLimit(1)
                 .shadow(radius: 4)
             Spacer()
-            if party.hub.mode == .voiceProcessing, party.hub.voiceProcessingFailed {
-                Label("Echo cancellation isn't available on this Mac. Headphones recommended.", systemImage: "headphones")
-                    .font(.callout).foregroundStyle(.white.opacity(0.75))
-                    .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(Capsule().fill(.black.opacity(0.45)))
-            }
+            if case .waitingForPartner(let code) = party.phase { CodeChip(code: code) }
             if party.phase == .together, party.role == .host, party.preparing == nil, party.transferFraction < 1 {
                 Text("Sending the film: \(Int(party.transferFraction * 100))%")
                     .font(.callout).foregroundStyle(.white.opacity(0.75))
@@ -178,12 +181,13 @@ struct PartyView: View {
                 }
                 .buttonStyle(CircleButtonStyle(prominent: true))
                 .help(playback.intendsToPlay ? "Pause for both of you (space)" : "Play for both of you (space)")
+                .accessibilityLabel(playback.intendsToPlay ? "Pause" : "Play")
                 Button { playback.skip(by: -10) } label: {
                     Image(systemName: "gobackward.10").font(.system(size: 17)).frame(width: 38, height: 38)
-                }.buttonStyle(CircleButtonStyle())
+                }.buttonStyle(CircleButtonStyle()).help("Back 10 seconds (←)").accessibilityLabel("Back 10 seconds")
                 Button { playback.skip(by: 10) } label: {
                     Image(systemName: "goforward.10").font(.system(size: 17)).frame(width: 38, height: 38)
-                }.buttonStyle(CircleButtonStyle())
+                }.buttonStyle(CircleButtonStyle()).help("Forward 10 seconds (→)").accessibilityLabel("Forward 10 seconds")
                 Text("\(timeString(scrubbing ?? playback.position)) / \(timeString(playback.duration))")
                     .font(.system(size: 14, weight: .medium).monospacedDigit())
                     .foregroundStyle(.white.opacity(0.85))
@@ -203,11 +207,19 @@ struct PartyView: View {
                              help: bubbleVisible ? "Hide the video bubble" : "Show the video bubble") {
                     withAnimation(.spring(duration: 0.3)) { bubbleVisible.toggle() }
                 }
+                Button { showQuality.toggle() } label: {
+                    Image(systemName: "info.circle").font(.system(size: 17)).frame(width: 38, height: 38)
+                }
+                .buttonStyle(CircleButtonStyle())
+                .help("Playback quality")
+                .accessibilityLabel("Playback quality")
+                .popover(isPresented: $showQuality, arrowEdge: .top) { QualityView(party: party, playback: playback) }
                 Button { toggleFullScreen() } label: {
                     Image(systemName: "arrow.up.left.and.arrow.down.right").font(.system(size: 16)).frame(width: 38, height: 38)
                 }
                 .buttonStyle(CircleButtonStyle())
                 .help("Full screen (F)")
+                .accessibilityLabel("Full screen")
             }
             .disabled(!enabled)
         }
@@ -364,9 +376,13 @@ struct PreparingView: View {
             Text("Preparing film… \(Int(preparing.fraction * 100))%")
                 .font(.title2.monospacedDigit())
             ProgressView(value: preparing.fraction).frame(width: 280).tint(Theme.accent)
-            Text(preparing.remuxOnly
-                 ? "Rewrapping it for macOS. No quality is lost."
-                 : "Converting it for macOS with this Mac's video encoder.")
+            Text(preparing.repairingTiming
+                 ? (preparing.remuxOnly
+                    ? "This file's timing information is damaged. Repairing it; no quality is lost."
+                    : "This file's timing information is damaged and couldn't be repaired. Converting the picture instead.")
+                 : (preparing.remuxOnly
+                    ? "Rewrapping it for macOS. No quality is lost."
+                    : "Converting it for macOS with this Mac's video encoder."))
                 .font(.callout).foregroundStyle(Theme.secondaryText)
             Button(action: cancel) { Text("Cancel").frame(width: 120, height: 34) }
                 .buttonStyle(SoftButtonStyle()).padding(.top, 4)
@@ -401,10 +417,8 @@ struct WaitingForPartnerCard: View {
                     .frame(width: 150, height: 36)
             }
             .buttonStyle(SoftButtonStyle())
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Waiting for your partner…").foregroundStyle(Theme.secondaryText)
-            }
+            Label("Waiting for your partner. You can start watching meanwhile.", systemImage: "person.2")
+                .foregroundStyle(Theme.secondaryText)
             if let preparing {
                 Divider().overlay(Color.white.opacity(0.15)).frame(width: 300)
                 PreparingView(preparing: preparing, cancel: cancel)
@@ -455,6 +469,93 @@ struct ToggleButton: View {
         }
         .buttonStyle(.plain)
         .help(help)
+        .accessibilityLabel(help)
+    }
+}
+
+/// The room code while the host is already watching: small, out of the picture, one click to copy.
+struct CodeChip: View {
+    let code: String
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(code, forType: .string)
+            copied = true
+        } label: {
+            HStack(spacing: 8) {
+                Text("Code").foregroundStyle(.white.opacity(0.6))
+                Text(RoomCode.pretty(code)).font(.system(size: 14, weight: .semibold, design: .rounded).monospaced())
+                Image(systemName: copied ? "checkmark" : "doc.on.doc").font(.system(size: 11)).foregroundStyle(.white.opacity(0.7))
+            }
+            .font(.callout)
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(Capsule().fill(.black.opacity(0.45)))
+            .overlay(Capsule().stroke(.white.opacity(0.12)))
+        }
+        .buttonStyle(.plain)
+        .help("Your room code. Click to copy it for your partner.")
+        .accessibilityLabel("Room code \(RoomCode.pretty(code)). Copy.")
+    }
+}
+
+/// What is being played and what happens to it on the way: for the curious, behind the info button.
+struct QualityView: View {
+    @ObservedObject var party: Party
+    @ObservedObject var playback: PlaybackController
+
+    private func origin(_ converted: Bool?) -> String {
+        switch converted {
+        case .some(false): return "Original stream, not re-encoded"
+        case .some(true): return party.role == .host ? "Converted on this Mac so both of you can play it" : "Converted on your partner's Mac so both of you can play it"
+        case nil: return party.role == .guest ? "As sent by your partner (their SameSofa is older and doesn't say more)" : ""
+        }
+    }
+
+    private var displayLine: (String, String) {
+        guard let screen = NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain })?.screen ?? NSScreen.main else { return ("Unknown", "") }
+        let top = Double(screen.maximumFramesPerSecond)
+        let variable = screen.maximumRefreshInterval > screen.minimumRefreshInterval * 1.05
+        let name = "\(screen.localizedName.isEmpty ? "This display" : screen.localizedName) · \(Int(top.rounded())) Hz" + (variable ? ", variable" : "")
+        let fps = playback.frameRate
+        guard fps >= 1 else { return (name, "") }
+        if variable { return (name, "Can follow the film's frame rate, so every frame is shown for the same time.") }
+        if FrameRateMatch.isEvenCadence(filmFrameRate: fps, refreshRate: top) { return (name, "Every film frame is shown for the same time.") }
+        return (name, String(format: "Fixed at %.0f Hz: a %.2f fps film can't be shown evenly, so motion may judder slightly. A display setting of ProMotion, or a multiple of the film's frame rate, avoids that.", top, fps))
+    }
+
+    var body: some View {
+        let hub = party.hub
+        let display = displayLine
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Playback quality").font(.headline)
+            row("Picture", playback.quality.video ?? "No picture", origin(party.sharedFilm?.videoConverted))
+            row("Sound", playback.quality.audio ?? "No sound", origin(party.sharedFilm?.audioConverted))
+            row("Film sound path", playback.systemSpatialAudio ? "Straight to the sound output, with the system's spatial audio" : "Straight to the sound output, no processing",
+                "The film is never routed through the call or the microphone clean-up.")
+            if hub.mode == .live {
+                row("Output", "\(hub.outputRoute.name) (\(hub.outputRoute.kind == .headphones ? "headphones" : "speakers"))", "")
+                row("Microphone", party.phase != .together ? "Not in use (no call)"
+                        : !party.micOn ? "Muted"
+                        : hub.cancelsFilmEcho ? "Echo cancellation removes the film and your partner's voice"
+                        : "Echo cancellation removes your partner's voice",
+                    party.phase == .together && party.micOn && !hub.cancelsFilmEcho
+                        ? (playback.systemSpatialAudio ? "With the system's spatial audio the film can't be removed from the microphone: use headphones."
+                           : "Headphones: the microphone doesn't hear the film.") : "")
+            }
+            row("Display", display.0, display.1)
+        }
+        .padding(18)
+        .frame(width: 430, alignment: .leading)
+    }
+
+    private func row(_ title: String, _ value: String, _ detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title.uppercased()).font(.caption2.weight(.semibold)).foregroundStyle(.secondary).tracking(0.6)
+            Text(value).font(.callout.monospacedDigit()).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            if !detail.isEmpty { Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+        }
     }
 }
 

@@ -13,18 +13,30 @@ struct SameSofaApp: App {
                 .environmentObject(model.settings)
                 .preferredColorScheme(.dark)
                 .frame(minWidth: 820, minHeight: 520)
+                .modifier(LaunchWindowOpener())
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1180, height: 720)
         .commands {
             CommandGroup(replacing: .newItem) {}
-            CommandGroup(after: .appInfo) { AcknowledgementsMenuItem() }
+            CommandGroup(replacing: .appInfo) { InfoMenuItems() }
+            CommandGroup(replacing: .help) { ShortcutsMenuItem() }
         }
+
+        Window("About SameSofa", id: "about") {
+            AboutView().preferredColorScheme(.dark)
+        }
+        .windowResizability(.contentSize)
 
         Window("Acknowledgements", id: "acknowledgements") {
             AcknowledgementsView().preferredColorScheme(.dark)
         }
-        .defaultSize(width: 640, height: 600)
+        .defaultSize(width: 680, height: 720)
+
+        Window("Keyboard Shortcuts", id: "shortcuts") {
+            ShortcutsView().preferredColorScheme(.dark)
+        }
+        .windowResizability(.contentSize)
 
         Settings {
             SettingsView()
@@ -77,7 +89,7 @@ struct RootView: View {
 extension LaunchOptions {
     /// Started by a script or test (command-line switches), not by a person.
     var isScripted: Bool {
-        server != nil || hostFilm != nil || joinCode != nil || synthetic || screen != nil || typeTest != nil
+        server != nil || hostFilm != nil || joinCode != nil || synthetic || screen != nil || typeTest != nil || show != nil
     }
 }
 
@@ -101,31 +113,36 @@ struct FirstLaunchNotice: View {
     }
 }
 
-/// SameSofa ▸ Acknowledgements…
-struct AcknowledgementsMenuItem: View {
+/// SameSofa ▸ About SameSofa, Acknowledgements…
+struct InfoMenuItems: View {
     @Environment(\.openWindow) private var openWindow
     var body: some View {
+        Button("About SameSofa") { openWindow(id: "about") }
         Button("Acknowledgements…") { openWindow(id: "acknowledgements") }
     }
 }
 
-/// The licence and third-party notices that ship inside the app.
-struct AcknowledgementsView: View {
-    private var text: String {
-        ["LICENSE", "THIRD-PARTY-NOTICES.md"].compactMap { name -> String? in
-            let parts = name.split(separator: ".", maxSplits: 1).map(String.init)
-            guard let url = Bundle.main.url(forResource: parts[0], withExtension: parts.count > 1 ? parts[1] : nil) else { return nil }
-            return try? String(contentsOf: url, encoding: .utf8)
-        }.joined(separator: "\n\n────────────────────────────────────────\n\n")
-    }
-
+/// Help ▸ Keyboard Shortcuts
+struct ShortcutsMenuItem: View {
+    @Environment(\.openWindow) private var openWindow
     var body: some View {
-        ScrollView {
-            Text(text.isEmpty ? "The notices are in THIRD-PARTY-NOTICES.md in SameSofa's source code." : text)
-                .font(.system(size: 12, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(20)
+        Button("Keyboard Shortcuts") { openWindow(id: "shortcuts") }
+    }
+}
+
+/// Screenshots only (`--show about` and the like): opens a window without a click.
+struct LaunchWindowOpener: ViewModifier {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
+    func body(content: Content) -> some View {
+        content.onAppear {
+            switch LaunchOptions.shared.show {
+            case "about": openWindow(id: "about")
+            case "acknowledgements": openWindow(id: "acknowledgements")
+            case "shortcuts": openWindow(id: "shortcuts")
+            case "settings": openSettings()
+            default: break
+            }
         }
     }
 }
