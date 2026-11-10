@@ -122,7 +122,8 @@ public final class Party: ObservableObject {
             self.preparer = preparer
             preparing = Preparing(fraction: 0, remuxOnly: plan.isRemuxOnly, speed: nil)
             preparer.onProgress = { [weak self, weak preparer] fraction, speed in
-                guard let self, let preparer, preparer === self.preparer else { return }
+                // A late progress report must not bring "Preparing" back once sharing started.
+                guard let self, let preparer, preparer === self.preparer, self.sender == nil else { return }
                 self.preparing = Preparing(fraction: fraction, remuxOnly: plan.isRemuxOnly, speed: speed)
                 if Date().timeIntervalSince(self.lastPreparingSent) > 0.5 {
                     self.lastPreparingSent = Date()
@@ -423,8 +424,30 @@ final class ControlChannel: NSObject, RTCDataChannelDelegate {
     }
 
     func send(_ message: ControlMessage) {
-        guard channel.readyState == .open else { queue.append(message); return }
-        channel.sendData(RTCDataBuffer(data: message.encoded(), isBinary: false))
+        queue.append(message)
+        flush()
+    }
+
+    private var retryScheduled = false
+
+    /// Sends what is queued, in order. `sendData` refuses messages when the
+    /// connection's send buffer is full (the film transfer shares it); those
+    /// are kept and retried shortly instead of being lost.
+    private func flush() {
+        guard channel.readyState == .open else { return }
+        while let message = queue.first {
+            guard channel.sendData(RTCDataBuffer(data: message.encoded(), isBinary: false)) else {
+                if !retryScheduled {
+                    retryScheduled = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                        self.retryScheduled = false
+                        self.flush()
+                    }
+                }
+                return
+            }
+            queue.removeFirst()
+        }
     }
 
     func close() {
@@ -433,12 +456,7 @@ final class ControlChannel: NSObject, RTCDataChannelDelegate {
     }
 
     func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
-        DispatchQueue.main.async {
-            guard self.channel.readyState == .open else { return }
-            let pending = self.queue
-            self.queue.removeAll()
-            pending.forEach(self.send)
-        }
+        DispatchQueue.main.async { self.flush() }
     }
 
     func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {

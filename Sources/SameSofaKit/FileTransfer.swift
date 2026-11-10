@@ -14,7 +14,9 @@ final class FileSender: NSObject, RTCDataChannelDelegate {
     private var channel: RTCDataChannel?
     private var pending: [Int] = []
     private var pendingSet = Set<Int>()
-    private let highWater: UInt64 = 2 * 1024 * 1024
+    /// Kept well below the connection's whole send buffer (about 2 MB in
+    /// WebRTC's SCTP), so control messages always have room next to the film.
+    private let highWater: UInt64 = 1024 * 1024
     private(set) var bytesSent: Int64 = 0
     /// Optional upload cap for testing slow connections (SAMESOFA_THROTTLE_BPS).
     private let throttleBytesPerSecond: Double?
