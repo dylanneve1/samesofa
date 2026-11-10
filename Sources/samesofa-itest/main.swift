@@ -3,6 +3,7 @@
 // synthetic camera and microphone (no hardware, no sound out of the speakers).
 //
 // Usage: samesofa-itest --server ws://127.0.0.1:8787 --film test.mp4 [--soak 120] [--throttle 400000]
+//        samesofa-itest --server ws://127.0.0.1:8787 --convert-suite a.mkv,b.avi,...   (see ConversionSuite.swift)
 
 import AVFoundation
 import CryptoKit
@@ -29,6 +30,12 @@ if args["audio-check"] != nil {
     print("voice processing: \(hub.voiceProcessingFailed ? "unavailable, fell back" : "active"); engine: \(hub.engineError ?? "running")")
     hub.stop()
     exit(0)
+}
+
+// Conversion suite: MKV/AVI/... converted on the host, played in sync on the guest.
+if let list = args["convert-suite"], let server = args["server"].flatMap(URL.init(string:)) {
+    let films = list.split(separator: ",").map { URL(fileURLWithPath: String($0)) }
+    ConversionSuite(server: server, referenceFFmpeg: args["reference-ffmpeg"]).run(films: films)
 }
 
 guard let server = args["server"].flatMap(URL.init(string:)), let filmPath = args["film"] else {
