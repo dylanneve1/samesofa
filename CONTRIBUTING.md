@@ -1,7 +1,7 @@
 # Contributing
 
 Thanks for helping. Bug reports, fixes and improvements are welcome as GitHub
-issues and pull requests. Please run `swift test` and `(cd server && npm test)`
+issues and pull requests. Please run `swift test` (after `scripts/build-apm.sh`, once) and `(cd server && npm test)`
 before sending a pull request.
 
 ## Licence of contributions (the one rule that matters)

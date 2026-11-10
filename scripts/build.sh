@@ -3,19 +3,24 @@
 #
 #   scripts/build.sh                         # placeholder server address
 #   SAMESOFA_SERVER_URL=wss://sofa.example.org scripts/build.sh   # bake in your server
+#   SAMESOFA_PROJECT_URL=https://example.org/samesofa ...          # "Source code" link in the About box
 #
 # Signing: uses SAMESOFA_SIGN_IDENTITY if set (e.g. "Developer ID Application: ..."),
 # with the hardened runtime. Otherwise the app is ad-hoc signed. Never notarizes.
 set -eu
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
-VERSION=${SAMESOFA_VERSION:-1.1.0}
+VERSION=${SAMESOFA_VERSION:-1.2.0}
 BUILD_NUMBER=${SAMESOFA_BUILD_NUMBER:-1}
 SERVER_URL=${SAMESOFA_SERVER_URL:-}
+# Where the source code lives, for the About box (optional).
+PROJECT_URL=${SAMESOFA_PROJECT_URL:-}
 ARCHS=${SAMESOFA_ARCHS:-"arm64 x86_64"}
 export DEVELOPER_DIR=${DEVELOPER_DIR:-$(xcode-select -p)}
 
 scripts/fetch-webrtc.sh
+# WebRTC's audio processing (echo canceller), a static library linked into the app.
+SAMESOFA_ARCHS="$ARCHS" scripts/build-apm.sh
 # The LGPL FFmpeg helper that converts MKV/AVI/... (separate programs, not linked).
 # SAMESOFA_NO_FFMPEG=1 leaves it out: then only MP4/MOV films can be hosted.
 if [ "${SAMESOFA_NO_FFMPEG:-}" != 1 ]; then
@@ -36,7 +41,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resourc
 cp "$BIN_DIR/SameSofa" "$APP/Contents/MacOS/SameSofa"
 ditto Vendor/WebRTC.xcframework/macos-x86_64_arm64/WebRTC.framework "$APP/Contents/Frameworks/WebRTC.framework"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-cp LICENSE THIRD-PARTY-NOTICES.md "$APP/Contents/Resources/"
+cp LICENSE THIRD-PARTY-NOTICES.md DISCLAIMER.md "$APP/Contents/Resources/"
+mkdir -p "$APP/Contents/Resources/APM"
+cp Vendor/APM/BUILDINFO.txt Vendor/APM/LICENSE.webrtc-audio-processing Vendor/APM/LICENSE.abseil "$APP/Contents/Resources/APM/"
 if [ "${SAMESOFA_NO_FFMPEG:-}" != 1 ]; then
   # ffmpeg/ffprobe in Contents/Helpers, their LGPL libraries in Contents/Frameworks
   # (the programs look there via @executable_path/../Frameworks).
@@ -68,6 +75,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>NSCameraUsageDescription</key><string>SameSofa shows your face to your partner in a little bubble while you watch.</string>
 	<key>NSMicrophoneUsageDescription</key><string>SameSofa lets you talk to your partner while you watch.</string>
 	<key>SameSofaDefaultServerURL</key><string>$SERVER_URL</string>
+	<key>SameSofaProjectURL</key><string>$PROJECT_URL</string>
 </dict>
 </plist>
 PLIST

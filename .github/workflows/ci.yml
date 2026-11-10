@@ -50,6 +50,16 @@ jobs:
         run: |
           Vendor/FFmpeg/bin/ffmpeg -hide_banner -buildconf
           ! Vendor/FFmpeg/bin/ffmpeg -hide_banner -buildconf | grep -E -- '--enable-(gpl|nonfree|version3)'
+      # WebRTC's audio processing module (echo canceller), a static library the package links.
+      - name: Cache echo canceller
+        uses: actions/cache@v4
+        with:
+          path: Vendor/APM
+          key: apm-arm64-${{ hashFiles('scripts/build-apm.sh') }}
+      - name: Build echo canceller (arm64)
+        run: |
+          brew install meson ninja
+          SAMESOFA_ARCHS=arm64 scripts/build-apm.sh
       - name: Unit tests
         run: swift test
       - name: Build app bundle (Apple silicon)

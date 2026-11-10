@@ -17,9 +17,16 @@ hear each other.
 - **Video call bubble** over the film: drag it anywhere, make it bigger or
   smaller, hide it. Mute and camera-off buttons. Controls fade away while the
   film plays.
-- **No echo** of the film through the other person's microphone: the film, the
-  voice and the microphone all go through Apple's voice processing (details
-  below), with separate film and voice volume sliders.
+- **The film at full quality.** Its sound goes straight from the player to the
+  Mac's sound output, bit for bit as decoded; nothing of the call touches it.
+  Surround tracks are folded down by macOS with the standard coefficients.
+- **No echo** of the film through the other person's microphone: with
+  speakers, SameSofa removes the film and your partner's voice from your
+  microphone itself (WebRTC's AEC3, details below); with headphones, detected
+  automatically, that isn't needed. Separate film and voice volume sliders.
+- **Damaged files repaired.** Films whose video timing information is missing
+  (frames would jump back and forth) are fixed on the host before sharing,
+  without re-encoding.
 - **Private by design**: no accounts, no analytics, nothing stored on a server.
 
 ![Joined and ready to play](docs/screenshots/guest-joined.png)
@@ -34,6 +41,11 @@ hear each other.
 | ![Preparing an MKV while the code is shown](docs/screenshots/preparing.png) | ![The guest sees the host's progress](docs/screenshots/guest-preparing.png) |
 
 ![A converted MKV playing with its subtitles](docs/screenshots/playing-subtitles.png)
+
+| | |
+|---|---|
+| ![Watching alone while waiting: the code moves to a chip; the ⓘ button shows what is being played and how](docs/screenshots/quality.png) | ![Acknowledgements](docs/screenshots/acknowledgements.png) |
+| ![Settings](docs/screenshots/settings.png) | ![About](docs/screenshots/about.png) |
 
 *(Screenshots use a generated test film and a generated stand-in camera
 picture.)*
@@ -72,8 +84,10 @@ picture.)*
 - Either of you can press **Play together**, pause, or skip. Move the mouse to
   bring the controls back. Double-click the film (or press **F**) for full
   screen. **Space** plays/pauses, **←/→** skip 10 seconds, **M** mutes you.
-- Watching on laptop speakers works; headphones give the best film sound (see
-  *Settings → Audio*).
+- Speakers and headphones both work and both play the film untouched.
+  *Settings → Audio → Headphones* is on **Automatic**; set it by hand if
+  SameSofa guesses your sound output wrong. The **ⓘ** button in the controls
+  shows what is being played and how.
 
 ---
 
@@ -91,8 +105,8 @@ Each stream is handled on its own:
 
 | Rewrapped (copied, seconds, no quality change) | Converted (re-encoded on the host) |
 |---|---|
-| Video: H.264 (8-bit 4:2:0), HEVC/H.265 Main and Main 10 | Video: MPEG-4 ASP (Xvid, DivX), VP8, VP9, AV1, MPEG-2, MPEG-1, VC-1/WMV, H.263, Theora, MJPEG, H.264 High 10/4:2:2/4:4:4, and anything else FFmpeg reads → H.264, or HEVC for 10-bit/HDR and above 1080p, with the Mac's VideoToolbox encoder at the same size and frame rate |
-| Audio: AAC, AC-3, E-AC-3 (Dolby Digital/Plus), ALAC | Audio: MP3, DTS, Opus, Vorbis, FLAC, TrueHD, PCM, MP2, WMA, … → AAC (stereo 192 kbit/s, 5.1 384 kbit/s; 7.1 is mixed to 5.1) |
+| Video: H.264 (8-bit 4:2:0), HEVC/H.265 Main and Main 10 | Video: MPEG-4 ASP (Xvid, DivX), VP8, VP9, AV1, MPEG-2, MPEG-1, VC-1/WMV, H.263, Theora, MJPEG, H.264 High 10/4:2:2/4:4:4, and anything else FFmpeg reads → H.264, or HEVC for 10-bit/HDR and above 1080p, with the Mac's VideoToolbox encoder at the same size and frame rate, at bit rates chosen to be visually transparent (1080p: 10 Mbit/s H.264, 7.5 Mbit/s HEVC; 4K HEVC: 21 Mbit/s and up; more for 60 fps, 10-bit and HDR; never less than the source used). 10-bit, colour tags and HDR10 metadata are kept |
+| Audio: AAC, AC-3, E-AC-3 (Dolby Digital/Plus), ALAC, FLAC | Audio: MP3, DTS, Opus, Vorbis, MP2, WMA, … → AAC-LC from Apple's encoder (stereo 256 kbit/s, 5.1 448 kbit/s; 7.1 is mixed to 5.1 at 640 kbit/s). Lossless stereo (PCM, TrueHD, DTS-HD MA) → Apple Lossless; lossless surround → AAC at the rates above. Levels are never changed |
 | Subtitles: the first text track (SRT, ASS/SSA, WebVTT) or a same-named `.srt`, as an MP4 text track | |
 
 Measured on a 2020 Mac mini (M1, 16 GB) with 10-minute 1080p24 test films:
@@ -110,6 +124,17 @@ needs rewrapping is ready in well under a minute, and a two-hour 1080p film that
 roughly 14 minutes on an M1 (faster on newer Macs, slower on Intel Macs
 without a recent hardware encoder).
 
+**Damaged timing.** Some MP4/MKV files carry video with B-frames but no
+reordering information (every frame's presentation time equals its decode
+time). FFmpeg-based players hide this; AVFoundation shows the frames in decode
+order, which looks like the picture flickering back and forth. SameSofa
+checks for it when you pick a film (it decodes three short stretches and
+compares the decoder's picture order with the file's times) and repairs it by
+copying the streams with rebuilt presentation times (FFmpeg's `dts2pts`, plus
+exact times for the last few frames, which that filter cannot work out). The
+result is checked again before sharing; if it doesn't hold up, the picture is
+re-encoded instead and the app says so.
+
 Only the default (or first) video and audio track are kept, to keep the
 transfer small. What doesn't work: picture-based subtitles (Blu-ray PGS, DVD
 VobSub), DRM-protected files, and files FFmpeg itself can't read. The host is
@@ -126,8 +151,8 @@ told straight away if a film can't be used.
  │ SyncEngine ◄───────────┼──── clock ping/pong, chunk requests ──────────►│ SyncEngine
  │ FileSender ────────────┼──── file channel: original bytes (64 KiB) ────►│ FileReceiver → sparse temp file
  │                        │                                                 │   → AVAssetResourceLoader → AVPlayer
- │ AudioHub (AVAudioEngine│◄─── WebRTC audio + video (camera, mic) ───────►│ AudioHub
- │  + voice processing)   │        all peer to peer, DTLS/SRTP encrypted    │
+ │ AudioHub (call audio,  │◄─── WebRTC audio + video (camera, mic) ───────►│ AudioHub
+ │  AEC3 on the mic)      │        all peer to peer, DTLS/SRTP encrypted    │
  └──────────▲─────────────┘                                                 └──────────▲─────────────┘
             │  WebSocket: "create room" / "join ABC123" / relay offer, answer, ICE        │
             └──────────────────────► server/ (tiny Node room server) ◄──────────────────┘
@@ -177,20 +202,20 @@ before sharing:
 3. **Convert** with the bundled `ffmpeg` into a temporary MP4. Video is encoded
    by the Mac's own VideoToolbox (hardware) encoder at the source's size and
    frame rate with a keyframe every 2 seconds (so seeks stay quick for the sync
-   engine), audio by FFmpeg's AAC encoder. The app shows real progress (from
+   engine), audio by Apple's AAC encoder (through FFmpeg's `aac_at`) or as
+   Apple Lossless. The app shows real progress (from
    `ffmpeg -progress`) and a Cancel button; the room is already open and the
    guest sees "Your partner's Mac is preparing the film… 43%".
 4. **Share** the MP4 exactly like any other MP4: same transfer, same sync,
-   same echo-cancelled audio path. The temporary file is deleted when the
+   same sound path. The temporary file is deleted when the
    session ends or the app quits, and leftovers from a crash at the next launch.
 
 Why this way round: the transfer, the sync engine and the echo cancellation
-(which takes the film's sound out of AVPlayer with an audio tap) all build on
-AVPlayer. Playing MKV directly with VLCKit or libmpv on both Macs would have
-meant a second sync implementation (their clocks, seeking and rate control
-behave differently), a second way to get the film's audio into the voice
-processing engine, a much larger LGPL/GPL dependency on both sides, and the
-guest would need it too. Converting on the host keeps the guest's side
+(which listens to the film's sound inside AVPlayer) all build on AVPlayer.
+Playing MKV directly with VLCKit or libmpv on both Macs would have meant a
+second sync implementation (their clocks, seeking and rate control behave
+differently), a second way to get at the film's audio, a much larger LGPL/GPL
+dependency on both sides, and the guest would need it too. Converting on the host keeps the guest's side
 unchanged and costs seconds for the common case (MKV with H.264/HEVC + AAC/AC-3
 just gets rewrapped). The price is a wait before sharing when a film has to be
 re-encoded, and some loss of quality in that case (generous bit rates keep it
@@ -218,59 +243,73 @@ Both apps run the same `SyncEngine` (in `Sources/SameSofaCore`, unit tested):
   control channel, minimum-round-trip sample wins).
 - Play is scheduled ~0.35 s in the future and started with
   `AVPlayer.setRate(_:time:atHostTime:)` so both start on the same instant.
-- Every half second each side compares its player with the timeline: gaps under
-  60 ms are ignored; up to 1 s the playback speed is nudged by up to ±4% (pitch
-  preserved) until it catches up; beyond that it seeks.
+- Every half second the guest compares its player with the timeline: gaps under
+  60 ms are ignored; up to 0.35 s its playback speed is nudged by 0.2 to 1 %
+  (plain resampling, at most a sixth of a semitone, so it cannot be heard)
+  until the gap is closed; beyond that it seeks.
+- The host never changes speed. If its own player slips, the timeline moves to
+  where the player is and the guest follows. While nothing drifts, both players
+  run at exactly normal speed.
 - The host sends a heartbeat every second so a missed message is healed.
 
-### Echo cancellation: the approach and its limits
+### The film's sound, and echo cancellation
 
-The problem: both Macs play the film out loud. The guest's microphone hears the
-guest's film and the host's voice, and without care the host would hear their
-own voice and a second, delayed copy of the film.
+**The film** is played by AVPlayer straight to the Mac's sound output: no
+audio engine of SameSofa's, no Apple voice processing, no resampling or level
+change in between, whether or not a call is running. Its audio is set up once
+per film and never touched again (spatial audio is switched off by default so
+that surround and Dolby Atmos tracks are decoded to a plain multichannel
+signal, which macOS folds down for stereo outputs: left and right at full
+level, centre and surrounds at -3 dB, no LFE; *Settings → Audio → Spatial
+audio: System* hands this back to macOS). Earlier versions pulled the film's
+sound out of the player and replayed it through the call's audio engine,
+which is where its quality problems came from.
 
-WebRTC has an echo canceller (AEC3), but on macOS WebRTC opens the speakers and
-microphone itself and only knows about the audio *it* plays (the other person's
-voice). Audio played by AVPlayer is invisible to it, so it cannot remove the
-film. An echo canceller can only remove what it has as a **reference**.
+**The echo problem:** both Macs play the film out loud. The guest's microphone
+hears the guest's film and the host's voice, and without care the host would
+hear their own voice and a second, delayed copy of the film. An echo canceller
+can only remove what it has as a **reference**. WebRTC's own canceller only
+knows the voice it plays; the film, played by AVPlayer, is invisible to it.
 
-So SameSofa routes everything through **one audio engine**:
+So SameSofa runs its own instance of the same canceller and tells it
+everything the speakers play:
 
-- `AudioHub` is a custom WebRTC audio device (WebRTC's `RTCAudioDevice` protocol;
-  the macOS framework implements it but doesn't ship the header, so it is
-  re-declared in `Sources/CWebRTCAudioDevice`). WebRTC hands it the remote voice
-  to play and receives the microphone from it.
-- It runs an `AVAudioEngine` with **Apple's voice processing** enabled on the
-  input node (`setVoiceProcessingEnabled(true)`, the same echo cancellation and
-  noise suppression FaceTime uses).
-- The film's decoded audio is taken out of AVPlayer with an
-  `MTAudioProcessingTap`, AVPlayer's own output is silenced, and the film is
-  played through the same engine. The other person's voice is played there too.
-- Because the voice-processing unit plays both, both are its echo reference and
-  are removed from the microphone before WebRTC sends it. SameSofa also asks
-  WebRTC to switch its own echo cancellation and gain control off, so two
-  cancellers don't fight (whether WebRTC M157 still honours these legacy
-  constraints hasn't been verified; if it doesn't, its canceller simply finds
-  little left to remove).
-- The film and voice volume sliders are mixer volumes in that engine.
+- `AudioHub` is a custom WebRTC audio device (WebRTC's `RTCAudioDevice`
+  protocol; the macOS framework implements it but doesn't ship the header, so
+  it is re-declared in `Sources/CWebRTCAudioDevice`). It plays the other
+  person's voice and records the microphone through a plain `AVAudioEngine`,
+  only while a call is running.
+- Each 10 ms of microphone audio goes through WebRTC's audio processing module
+  (AEC3 echo canceller, noise suppression, gain control; the stand-alone
+  `webrtc-audio-processing` build, linked statically) before WebRTC gets it.
+  WebRTC's built-in processing is switched off.
+- The canceller's reference is the voice being played plus a **copy** of the
+  film's sound: an `MTAudioProcessingTap` listens inside AVPlayer without
+  changing anything (measured bit-exact, see Tests), the copy is folded down
+  to stereo and lined up with the film's clock, so that the reference is what
+  the speakers are playing at that moment, through pauses, seeks and sync
+  nudges. AEC3 finds the remaining delay (speaker and room) itself.
+- With **headphones** (built-in jack, AirPods and other Bluetooth headphones,
+  USB headsets: recognised from the sound output's type) the microphone does
+  not hear the film, the film is left out of the reference and no tap is
+  attached at all. *Settings → Audio → Headphones* overrides the detection.
+- If AirPods are both output and microphone, macOS switches them to telephone
+  quality; SameSofa then records from the Mac's built-in microphone instead,
+  so the film keeps its full quality.
 
 Limits, honestly:
 
-- This could only be tested on a Mac with **no microphone** (the build machine),
-  where voice processing cannot start; there the app falls back automatically
-  and shows "Echo cancellation isn't available on this Mac. Headphones
-  recommended." Real echo-cancellation quality with speakers and a laptop mic
-  has not been measured yet.
-- Voice processing is tuned for speech. Loud film audio at high volume through
-  laptop speakers is the hardest case: expect some residual film or ducking of
-  your voice in very loud scenes. If that's annoying, use headphones.
-- With voice processing on, macOS may play the film in a slightly reduced
-  quality mode (it is a "voice chat" audio path). **Settings → Audio →
-  Headphones** turns voice processing off for full-quality film sound; then
-  headphones are needed to avoid echo.
-- The film's sound goes through a small buffer (~50 ms or less) on its way to
-  the engine, so it can lag the picture by a few tens of milliseconds.
-- Surround tracks are mixed down to stereo (dialogue kept in the middle).
+- The build machine has **no microphone**. The canceller was measured in an
+  offline simulation (film through a synthetic room into the "microphone",
+  plus a person talking: see Tests), not with real speakers and a real
+  microphone. Expect it to behave like a browser video call that has music
+  playing on the same computer.
+- Loud film sound through laptop speakers while you talk is the hardest case:
+  the canceller then also takes a little off your voice. Headphones avoid it.
+- A film's echo that the canceller cannot model (very reverberant rooms,
+  speakers far from the microphone, a Bluetooth speaker with a long delay)
+  comes through faintly.
+- Real Dolby Atmos content could not be tested (FFmpeg cannot create it).
 
 ### The room server
 
@@ -375,7 +414,7 @@ SAMESOFA_SERVER_URL=wss://sofa.example.org scripts/build.sh   # bake in your ser
 ```
 
 `scripts/build.sh` downloads WebRTC (checksum verified) into `Vendor/`, builds
-the FFmpeg helper (below), builds with SwiftPM, assembles `build/SameSofa.app`
+the echo canceller library and the FFmpeg helper (below), builds with SwiftPM, assembles `build/SameSofa.app`
 (Info.plist with camera and microphone usage strings, WebRTC.framework and the
 FFmpeg helper embedded) and signs it:
 
@@ -385,6 +424,13 @@ FFmpeg helper embedded) and signs it:
   Apple Developer account, which removes the "Open Anyway" step;
 - otherwise it **ad-hoc** signs (fine for personal use, needs the Gatekeeper
   step above).
+
+**The echo canceller.** `scripts/build-apm.sh` (run by `build.sh`; run it
+once yourself before `swift build` or `swift test`) downloads
+webrtc-audio-processing 2.1 (pinned, SHA-256 checked; its Abseil dependency
+comes from the pinned meson wrap inside), and builds it for arm64 and x86_64
+into `Vendor/APM` as one static library (about a minute, once). It needs
+`brew install meson ninja`.
 
 **The FFmpeg helper.** `scripts/build-ffmpeg.sh` (run by `build.sh`) downloads
 FFmpeg 8.1.3 and dav1d 1.5.4 (pinned, SHA-256 checked), and builds them for
@@ -397,7 +443,8 @@ scripts/build.sh` leaves the helper out; that build can only host MP4/MOV.
 ### Tests
 
 ```sh
-swift test                          # sync engine, clock sync, chunk scheduling, byte-exact reassembly
+scripts/build-apm.sh                # once: the echo canceller library the package links
+swift test                          # sync engine, conversion planner, timestamp repair logic, sound routing
 (cd server && npm ci && npm test)   # room server
 ```
 
@@ -417,8 +464,14 @@ swift build --product samesofa-itest
 It checks: room by code (typed in lower case with a dash), video and audio both
 ways, guest playback without having the file, clock-offset discovery (the guest
 pretends its clock is 1234.567 s off), play/pause/seek from both sides, recovery
-from a forced 0.7 s and 4 s drift, drift under 0.25 s for the soak period, the
-received file being byte-identical (SHA-256), and leaving/rejoining. The
+from a forced drift (0.2 s closed by a speed change of at most 1 %, 0.7 s and
+4 s by seeking), drift under 0.25 s for the soak period, that the host never
+changes speed, that each film's sound is set up exactly once, that muting,
+the headphones setting, the volume and a change of sound devices leave the
+film untouched (same speed, no break in its sound, no shift against the
+timeline), the received file being byte-identical (SHA-256), and
+leaving/rejoining. `--live-audio 1` runs the host with the real call audio
+engine (silent) instead of the synthetic one. The
 `--throttle` run caps the host's upload below the film's bitrate and checks that
 both sides pause when the guest runs dry and resume together.
 
@@ -450,19 +503,50 @@ on GitHub's macOS runners. It is manual-only at the moment because GitHub
 Actions isn't available for the account; the comment in the file shows how to
 switch it back to running on every push.
 
-`.build/debug/samesofa-itest --audio-check` starts the real voice-processing
-audio engine at zero volume and reports whether it runs on that Mac.
+Damaged timestamps: builds H.264 and HEVC clips with B-frames whose picture
+carries the frame number, strips their presentation times (`pts = dts`), and
+checks detection, the repair (every frame back at its original time, read
+back from the picture as AVFoundation presents it; sound unmoved), the
+fallback to re-encoding, and that healthy films raise no alarm:
+
+```sh
+.build/debug/samesofa-itest --timestamp-suite /tmp/ts --reference-ffmpeg "$(which ffmpeg)" --healthy film1.mkv,film2.mp4
+```
+
+The film's sound path, without playing a sound: plays each file with a real
+AVPlayer (muted), compares what the player goes on to play with the decoded
+source (it must be bit-exact, with no dropped or repeated samples, the film's
+clock steady and the sound set up once), renders the same tap offline through
+AVFoundation's stereo fold-down, and shows what SameSofa 1.1.0 did to the
+same channels. The last step, the Mac's sound output itself, cannot be
+captured without a loopback device:
+
+```sh
+.build/debug/samesofa-itest --audio-measure a.m4a,b.mp4 --seconds 60 --reference-ffmpeg "$(which ffmpeg)"
+```
+
+The echo canceller, simulated offline (film through a synthetic room into the
+microphone, plus a talker; reports how much of the film is removed and how
+much of the talker survives):
+
+```sh
+.build/debug/samesofa-itest --echo-sim film.wav,talker.wav     # 48 kHz stereo film, 48 kHz talker
+```
+
+`.build/debug/samesofa-itest --audio-check 1` starts the real call audio
+engine at zero volume and reports whether it runs on that Mac, the sound
+output it found and whether it counts as headphones.
 
 ### Layout
 
 ```
-Sources/SameSofaCore      protocol messages, sync engine, clock sync, chunk map/scheduler, film conversion planner (pure Swift, unit tested)
+Sources/SameSofaCore      protocol messages, sync engine, clock sync, chunk map/scheduler, film conversion planner, timestamp checks, sound routing (pure Swift, unit tested)
 Sources/SameSofaKit       WebRTC call, data channels, file sender/receiver, playback controller, audio engine, FFmpeg helper runner
 Sources/SameSofa          the SwiftUI app
 Sources/samesofa-itest    end-to-end test runner
-Sources/CWebRTCAudioDevice, CAudioTap   small C/Objective-C headers and shims
+Sources/CWebRTCAudioDevice, CAudioTap, CEchoCanceller   small C/Objective-C/C++ headers and shims
 server/                   room server (Node + ws), tests, Dockerfile, systemd unit
-scripts/                  build.sh, fetch-webrtc.sh, build-ffmpeg.sh, make-icon.swift; dev/ test-film and screenshot helpers
+scripts/                  build.sh, fetch-webrtc.sh, build-apm.sh, build-ffmpeg.sh, make-icon.swift; dev/ test-film and screenshot helpers
 ```
 
 ---
@@ -473,7 +557,18 @@ scripts/                  build.sh, fetch-webrtc.sh, build-ffmpeg.sh, make-icon.
   different countries, slow or lossy uplinks, and long (2-hour, multi-GB) films
   have not been exercised end to end. The throttled test simulates a slow
   uplink; real networks will add jitter.
-- Echo cancellation with real speakers and microphones is untested (see above).
+- Echo cancellation with real speakers and microphones is untested (simulated
+  only, see above), as are headphone detection on real devices and the switch
+  to the built-in microphone with Bluetooth headphones.
+- Frame-rate matching is a request to the display: on variable-refresh displays
+  (ProMotion, adaptive sync) macOS can follow it, on a display fixed at 60 Hz a
+  24 fps film still alternates between two and three refreshes per frame. The
+  build machine's display is fixed at 60 Hz, so the effect on a ProMotion
+  display is untested. SameSofa does not switch display modes.
+- Real Dolby Atmos (E-AC-3 JOC) content was not available for testing.
+- The timestamp repair handles the plain form of the defect (presentation time
+  equal to decode time); other kinds of damaged timing fall back to
+  re-encoding the picture.
 - The real camera path (`RTCCameraVideoCapturer`) is untested here (no camera on
   the build machine); tests and screenshots use a synthetic camera.
 - The film transfer and the video call share the host's upload. On a slow
@@ -505,7 +600,9 @@ scripts/                  build.sh, fetch-webrtc.sh, build-ffmpeg.sh, make-icon.
 |---|---|---|
 | [WebRTC](https://webrtc.org) M157, prebuilt by [stasel/WebRTC](https://github.com/stasel/WebRTC) | BSD-3-Clause (+ WebRTC patent grant) | calls, data channels (embedded `WebRTC.framework`) |
 | `RTCAudioDevice.h` copied from WebRTC | BSD-3-Clause | custom audio device protocol |
-| [FFmpeg](https://ffmpeg.org) 8.1.3 | LGPL-2.1-or-later | converting MKV/AVI/… on the host (separate helper programs) |
+| [webrtc-audio-processing](https://www.freedesktop.org/software/pulseaudio/webrtc-audio-processing/) 2.1 | BSD-3-Clause | echo cancellation, noise suppression, gain control for the microphone (linked statically) |
+| [Abseil](https://abseil.io) | Apache-2.0 | support library of the audio processing (linked statically) |
+| [FFmpeg](https://ffmpeg.org) 8.1.3 | LGPL-2.1-or-later | converting and repairing films on the host (separate helper programs) |
 | [dav1d](https://code.videolan.org/videolan/dav1d) 1.5.4 | BSD-2-Clause | AV1 decoding, inside the FFmpeg helper |
 | [ws](https://github.com/websockets/ws) | MIT | room server WebSocket |
 | Apple SF Symbols | Apple's terms, via the system | icons in the app |
