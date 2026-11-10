@@ -4,8 +4,9 @@
 #
 # LGPL only: no --enable-gpl, no --enable-nonfree. The one external library is
 # dav1d (BSD-2-Clause), the AV1 decoder, linked statically into libavcodec.
-# Video is encoded with Apple's VideoToolbox (hardware), audio with FFmpeg's
-# own AAC encoder. FFmpeg is built as shared libraries plus the ffmpeg and
+# Video is encoded with Apple's VideoToolbox (hardware), audio with Apple's
+# AudioToolbox AAC encoder (aac_at; FFmpeg's own AAC encoder is kept as a
+# fallback) or FFmpeg's ALAC encoder. FFmpeg is built as shared libraries plus the ffmpeg and
 # ffprobe programs, which the app runs as separate processes, so the LGPL code
 # is never linked into the SameSofa binary and can be replaced (see
 # THIRD-PARTY-NOTICES.md).
@@ -38,7 +39,7 @@ COMMON_FLAGS="--disable-gpl --disable-nonfree --disable-version3 --enable-libdav
  --enable-shared --disable-static --install-name-dir=@rpath
  --disable-autodetect --enable-videotoolbox --enable-audiotoolbox --enable-zlib --enable-bzlib
  --disable-doc --disable-ffplay --disable-avdevice --disable-network --disable-devices --disable-debug
- --disable-encoders --enable-encoder=aac,alac,h264_videotoolbox,hevc_videotoolbox,movtext
+ --disable-encoders --enable-encoder=aac,aac_at,alac,h264_videotoolbox,hevc_videotoolbox,movtext
  --disable-muxers --enable-muxer=mp4,mov,null,srt,webvtt
  --disable-filters --enable-filter=scale,format,aformat,aresample,null,anull,copy,acopy,setpts,asetpts,fps,pan,yadif
  --disable-protocols --enable-protocol=file,pipe"

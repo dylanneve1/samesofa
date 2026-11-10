@@ -23,6 +23,11 @@ public struct ProbedStream: Equatable, Sendable {
     public var frameRate: Double?
     public var fieldOrder: String?
     public var colorTransfer: String?
+    public var colorPrimaries: String?
+    public var colorSpace: String?
+    public var colorRange: String?
+    /// Frames the decoder may hold back for reordering (B-frames); nil if ffprobe didn't say.
+    public var hasBFrames: Int?
     public var channels: Int = 0
     public var sampleRate: Int = 0
     public var bitRate: Int?
@@ -120,6 +125,10 @@ public struct ProbeResult: Equatable, Sendable {
             s.frameRate = [avg, real].compactMap { $0 }.first { $0 > 0 && $0 <= 240 }
             s.fieldOrder = raw["field_order"] as? String
             s.colorTransfer = raw["color_transfer"] as? String
+            s.colorPrimaries = raw["color_primaries"] as? String
+            s.colorSpace = raw["color_space"] as? String
+            s.colorRange = raw["color_range"] as? String
+            s.hasBFrames = int(raw["has_b_frames"])
             s.channels = int(raw["channels"]) ?? 0
             s.sampleRate = int(raw["sample_rate"]) ?? 0
             let tags = raw["tags"] as? [String: Any] ?? [:]
@@ -150,10 +159,25 @@ public struct ConversionPlan: Equatable, Sendable {
         case encode(codec: VideoCodec, tenBit: Bool, bitRate: Int, keyframeInterval: Int, deinterlace: Bool)
     }
 
+    public enum AudioCodec: String, Sendable {
+        /// AAC-LC, encoded by Apple's AudioToolbox.
+        case aac
+        /// Apple Lossless: for lossless sources small enough to keep that way.
+        case alac
+    }
+
     public enum AudioAction: Equatable, Sendable {
         case copy
-        /// Re-encode to AAC with this many channels.
-        case encode(channels: Int, bitRate: Int)
+        /// Re-encode with this many channels (`bitRate` is ignored for lossless).
+        case encode(codec: AudioCodec, channels: Int, bitRate: Int)
+    }
+
+    /// Colour description of the source video, carried over when it is re-encoded.
+    public struct ColorTags: Equatable, Sendable {
+        public var primaries: String?
+        public var transfer: String?
+        public var space: String?
+        public var range: String?
     }
 
     public enum Subtitles: Equatable, Sendable {
@@ -175,6 +199,10 @@ public struct ConversionPlan: Equatable, Sendable {
 
     public var video: Video?
     public var audio: Audio?
+    /// The audio stream's codec and sample rate in the source (for encoder options).
+    public var audioSourceCodec: String?
+    public var audioSourceSampleRate = 0
+    public var videoColor: ColorTags?
     public var subtitles: Subtitles?
     public var duration: Double
     /// False when the film is already an MP4/MOV that macOS plays as it is:
@@ -182,6 +210,18 @@ public struct ConversionPlan: Equatable, Sendable {
     public var needsConversion: Bool
     /// Input needs regenerated timestamps (AVI).
     public var regenerateTimestamps = false
+    /// The video's presentation times are missing or contradict the picture
+    /// order in the bitstream (frames would play out of order): rebuild them
+    /// from the bitstream while copying (FFmpeg's dts2pts), no re-encoding.
+    public var repairVideoTimestamps = false
+    /// Exact times for the film's last few samples, which dts2pts cannot work out.
+    public var timestampTail: [TimestampTail.Correction] = []
+    /// What to do with the video if it is copied and the copy turns out
+    /// unusable (the timestamp repair doesn't validate): re-encode like this.
+    public var videoFallback: VideoAction?
+    /// Should the film's timestamps be checked before it is shared? True when
+    /// the video is copied and its codec reorders frames.
+    public var wantsTimestampCheck = false
     /// One line per decision, for logs.
     public var notes: [String] = []
 
@@ -197,6 +237,18 @@ public struct ConversionPlan: Equatable, Sendable {
 
     /// Only copies streams: takes seconds, no quality change.
     public var isRemuxOnly: Bool { !reencodesVideo && !reencodesAudio }
+
+    /// The plan to fall back on when the copied video can't be used: same, but re-encoding the video.
+    public var fallbackPlan: ConversionPlan? {
+        guard let video, case .copy = video.action, let fallback = videoFallback else { return nil }
+        var plan = self
+        plan.video = Video(stream: video.stream, action: fallback)
+        plan.repairVideoTimestamps = false
+        plan.videoFallback = nil
+        plan.needsConversion = true
+        plan.notes.append("video: timestamps could not be repaired, re-encoding instead")
+        return plan
+    }
 
     /// Arguments for the ffmpeg helper (everything after the program name).
     /// Progress is written to stdout in `-progress` format.
@@ -222,6 +274,7 @@ public struct ConversionPlan: Equatable, Sendable {
             switch video.action {
             case .copy(let tagHvc1):
                 a += ["-c:v", "copy"]
+                if repairVideoTimestamps { a += ["-bsf:v", TimestampTail.bitstreamFilter(tail: timestampTail)] }
                 if tagHvc1 { a += ["-tag:v", "hvc1"] }
             case .encode(let codec, let tenBit, let bitRate, let gop, let deinterlace):
                 if deinterlace { a += ["-vf", "yadif=mode=send_frame:deint=interlaced"] }
@@ -233,14 +286,26 @@ public struct ConversionPlan: Equatable, Sendable {
                           "-pix_fmt", tenBit ? "p010le" : "yuv420p", "-tag:v", "hvc1"]
                 }
                 a += ["-allow_sw", "1", "-b:v", String(bitRate), "-g", String(gop)]
+                // Keep the source's colour description (and with it HDR signalling).
+                let known = { (value: String?) -> String? in value.flatMap { ["unknown", "unspecified", "reserved", ""].contains($0) ? nil : $0 } }
+                if let v = known(videoColor?.primaries) { a += ["-color_primaries", v] }
+                if let v = known(videoColor?.transfer) { a += ["-color_trc", v] }
+                if let v = known(videoColor?.space) { a += ["-colorspace", v] }
+                if let v = known(videoColor?.range) { a += ["-color_range", v] }
             }
         }
         if let audio {
             switch audio.action {
             case .copy:
                 a += ["-c:a", "copy"]
-            case .encode(let channels, let bitRate):
-                a += ["-c:a", "aac", "-ac", String(channels), "-b:a", String(bitRate)]
+                // FFmpeg still calls FLAC in MP4 experimental; macOS plays it.
+                if audioSourceCodec == "flac" { a += ["-strict", "-2"] }
+            case .encode(.aac, let channels, let bitRate):
+                // Apple's encoder, constrained VBR at its best quality setting.
+                a += ["-c:a", "aac_at", "-aac_at_mode", "cvbr", "-aac_at_quality", "0", "-ac", String(channels), "-b:a", String(bitRate)]
+                if audioSourceSampleRate > 48_000 { a += ["-ar", "48000"] }
+            case .encode(.alac, let channels, _):
+                a += ["-c:a", "alac", "-ac", String(channels)]
             }
         }
         if subtitles != nil {
@@ -263,7 +328,18 @@ public enum MediaPlanner {
 
     /// Audio AVFoundation plays from an MP4. (MP3 is not among them: AVPlayer
     /// stays silent on MP3 inside MP4, so it is re-encoded like the rest.)
-    public static let copyableAudio: Set<String> = ["aac", "ac3", "eac3", "alac"]
+    /// FLAC in MP4 plays too (checked with AVPlayer). Opus in MP4 plays on
+    /// current macOS but could not be checked on the oldest macOS SameSofa
+    /// supports, and a guest with a silent film is worse than one careful
+    /// re-encode, so Opus is converted.
+    public static let copyableAudio: Set<String> = ["aac", "ac3", "eac3", "alac", "flac"]
+
+    /// Lossless sources that AVPlayer can't play from an MP4.
+    public static func isLossless(_ s: ProbedStream) -> Bool {
+        if s.codec.hasPrefix("pcm_") { return true }
+        if ["truehd", "mlp", "tta", "wavpack", "ape", "tak", "flac", "alac"].contains(s.codec) { return true }
+        return s.codec == "dts" && (s.profile ?? "").uppercased().contains("MA")
+    }
 
     /// Decides, stream by stream, what has to happen to `probe` for AVPlayer.
     /// `sidecarSubtitles` is the path of a same-named .srt next to the film.
@@ -281,8 +357,12 @@ public enum MediaPlanner {
         if let video {
             let action = videoAction(video, containerBitRate: probe.bitRate)
             plan.video = .init(stream: video.index, action: action)
+            plan.videoColor = .init(primaries: video.colorPrimaries, transfer: video.colorTransfer, space: video.colorSpace, range: video.colorRange)
             switch action {
-            case .copy: notes.append("video #\(video.index) \(video.codec): copy")
+            case .copy:
+                notes.append("video #\(video.index) \(video.codec): copy")
+                plan.videoFallback = encoding(for: video, containerBitRate: probe.bitRate)
+                plan.wantsTimestampCheck = ["h264", "hevc"].contains(video.codec) && (video.hasBFrames ?? 1) > 0
             case .encode(let codec, let tenBit, let bitRate, _, let deinterlace):
                 notes.append("video #\(video.index) \(video.codec) \(video.pixelFormat ?? "?"): encode \(codec.rawValue)\(tenBit ? " 10-bit" : "") \(bitRate / 1000) kbit/s\(deinterlace ? " deinterlaced" : "")")
             }
@@ -290,9 +370,12 @@ public enum MediaPlanner {
         if let audio {
             let action = audioAction(audio)
             plan.audio = .init(stream: audio.index, action: action)
+            plan.audioSourceCodec = audio.codec
+            plan.audioSourceSampleRate = audio.sampleRate
             switch action {
             case .copy: notes.append("audio #\(audio.index) \(audio.codec): copy")
-            case .encode(let channels, let bitRate): notes.append("audio #\(audio.index) \(audio.codec): encode aac \(channels) ch \(bitRate / 1000) kbit/s")
+            case .encode(.aac, let channels, let bitRate): notes.append("audio #\(audio.index) \(audio.codec): encode aac \(channels) ch \(bitRate / 1000) kbit/s")
+            case .encode(.alac, let channels, _): notes.append("audio #\(audio.index) \(audio.codec): encode alac \(channels) ch (lossless)")
             }
         }
         if let text = probe.streams.first(where: { $0.kind == .subtitle && textSubtitleCodecs.contains($0.codec) }) {
@@ -339,21 +422,60 @@ public enum MediaPlanner {
         // HEVC for 10-bit/HDR and anything above 1080p; H.264 otherwise (fastest, plays everywhere).
         let codec: ConversionPlan.VideoCodec = tenBit || pixels > 1920 * 1088 ? .hevc : .h264
         let fps = min(max(s.frameRate ?? 25, 1), 120)
-        // Generous bits per pixel: hardware encoders need more than x264 for the same quality.
-        let bitsPerPixel = codec == .hevc ? 0.09 : 0.14
-        var bitRate = Int(Double(pixels) * fps * bitsPerPixel)
-        // No point spending far more than the source did.
-        if let source = s.bitRate ?? containerBitRate, source > 0 { bitRate = min(bitRate, source * 2) }
-        bitRate = min(max(bitRate, 2_000_000), 60_000_000)
         let gop = max(Int((fps * 2).rounded()), 1)
-        return .encode(codec: codec, tenBit: tenBit, bitRate: bitRate, keyframeInterval: gop, deinterlace: s.isInterlaced)
+        return .encode(codec: codec, tenBit: tenBit, bitRate: videoBitRate(for: s, codec: codec, containerBitRate: containerBitRate),
+                       keyframeInterval: gop, deinterlace: s.isInterlaced)
     }
 
+    /// Bit rate for re-encoding with the Mac's hardware encoder, chosen so the
+    /// result is visually indistinguishable from the source rather than small.
+    ///
+    /// A ladder by picture size, frame rate and bit depth: 1080p at up to
+    /// 30 fps gets 10 Mbit/s as H.264 and 7.5 Mbit/s as HEVC; other sizes
+    /// scale with the pixel count to the power 0.75 (720p H.264: 5.4, 4K HEVC:
+    /// 21 Mbit/s), 60 fps costs 1.4 times as much, 10-bit 15 % and HDR another
+    /// 20 % more. It never goes below what the source itself used (more, if
+    /// the source's codec is more efficient than the hardware encoder),
+    /// unless the source is absurdly large (camera or editing formats).
+    static func videoBitRate(for s: ProbedStream, codec: ConversionPlan.VideoCodec, containerBitRate: Int?) -> Int {
+        let pixels = Double(max(s.width, 16) * max(s.height, 16))
+        let fps = min(max(s.frameRate ?? 25, 1), 120)
+        var ladder = (codec == .hevc ? 7_500_000.0 : 10_000_000.0) * pow(pixels / (1920 * 1080), 0.75)
+        if fps > 30 { ladder *= (fps / 30).squareRoot() }
+        if s.bitDepth > 8 || s.isHDR { ladder *= 1.15 }
+        if s.isHDR { ladder *= 1.2 }
+        ladder = max(ladder, 2_500_000)
+        // Anything 1080p-class (cropped "scope" pictures too) gets at least 8 / 6 Mbit/s.
+        if s.width >= 1800 || s.height >= 1000 { ladder = max(ladder, codec == .hevc ? 6_000_000 : 8_000_000) }
+        var bitRate = ladder
+        if let source = s.bitRate ?? containerBitRate, source > 0 {
+            // Modern software encoders squeeze more out of a bit than VideoToolbox does.
+            let efficient = ["av1", "vp9", "hevc", "vvc"].contains(s.codec)
+            let factor = efficient ? (codec == .h264 ? 1.6 : 1.3) : 1.0
+            bitRate = max(bitRate, Double(source) * factor)
+        }
+        return Int(min(bitRate, ladder * 4, 80_000_000))
+    }
+
+    /// Never re-encodes what AVPlayer can play. Otherwise: Apple Lossless for
+    /// lossless mono/stereo sources (about the size of the original), and for
+    /// everything else AAC-LC from Apple's encoder at rates where it is
+    /// transparent: 256 kbit/s stereo, 448 kbit/s for 5.1, 640 kbit/s when
+    /// 7.1 is folded to 5.1. The channel layout is kept (up to 5.1) and the
+    /// level is not changed.
     static func audioAction(_ s: ProbedStream) -> ConversionPlan.AudioAction {
         if copyableAudio.contains(s.codec), s.channels <= 8 { return .copy }
+        if isLossless(s), s.channels <= 2, s.sampleRate <= 96_000 {
+            return .encode(codec: .alac, channels: max(s.channels, 1), bitRate: 0)
+        }
         let channels = min(max(s.channels, 1), 6)
-        let bitRate = channels == 1 ? 96_000 : channels <= 2 ? 192_000 : 384_000
-        return .encode(channels: channels, bitRate: bitRate)
+        let bitRate: Int
+        switch channels {
+        case 1: bitRate = 128_000
+        case 2: bitRate = 256_000
+        default: bitRate = s.channels > 6 ? 640_000 : 448_000
+        }
+        return .encode(codec: .aac, channels: channels, bitRate: bitRate)
     }
 }
 
