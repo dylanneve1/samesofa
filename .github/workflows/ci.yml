@@ -1,9 +1,9 @@
 name: CI
 
-# Manual for now: GitHub Actions would not start jobs on this repository while
-# it was private. Once it is public (macOS runners are free for public repos),
-# replace this with:  on: { push: { branches: [main] }, pull_request: {} }
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -24,8 +24,26 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Cache WebRTC
+        uses: actions/cache@v4
+        with:
+          path: Vendor/WebRTC.xcframework
+          key: webrtc-${{ hashFiles('scripts/fetch-webrtc.sh') }}
       - name: Fetch WebRTC
         run: scripts/fetch-webrtc.sh
+      # The LGPL FFmpeg helper takes a few minutes to build; it only changes
+      # when scripts/build-ffmpeg.sh does.
+      - name: Cache FFmpeg helper
+        uses: actions/cache@v4
+        with:
+          path: Vendor/FFmpeg
+          key: ffmpeg-arm64-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+      - name: Build FFmpeg helper (arm64, LGPL)
+        run: SAMESOFA_ARCHS=arm64 scripts/build-ffmpeg.sh
+      - name: Check the FFmpeg helper is LGPL only
+        run: |
+          Vendor/FFmpeg/bin/ffmpeg -hide_banner -buildconf
+          ! Vendor/FFmpeg/bin/ffmpeg -hide_banner -buildconf | grep -E -- '--enable-(gpl|nonfree|version3)'
       - name: Unit tests
         run: swift test
       - name: Build app bundle (Apple silicon)
@@ -35,3 +53,13 @@ jobs:
           name: SameSofa-unsigned-arm64
           path: dist/*.zip
           retention-days: 7
+
+  # The end-to-end tests (two WebRTC peers, real AVPlayers, MKV/AVI conversion)
+  # are run on a Mac before each release; see "Tests" in the README. They are
+  # not run here: they need a full (GPL) FFmpeg to generate the test films,
+  # several minutes of real-time playback, and haven't been validated on
+  # GitHub's virtualised macOS runners (no real audio or video hardware).
+  end-to-end:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Skipped in CI by design (needs a physical Mac); run samesofa-itest locally, see README > Tests."
