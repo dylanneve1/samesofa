@@ -82,6 +82,9 @@ public enum ControlMessage: Codable, Equatable, Sendable {
     case pong(t0: Double, t1: Double)
     /// Camera on/off and mic mute state, so the other side can show it.
     case mediaState(cameraOn: Bool, micOn: Bool)
+    /// Host -> guest: the film is still being converted (MKV, AVI, ...); 0...1.
+    /// Older apps ignore it and simply wait for `fileInfo`.
+    case preparing(fraction: Double)
     case bye
 
     public static let protocolVersion = 1
