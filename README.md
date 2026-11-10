@@ -392,8 +392,35 @@ scripts/                  build.sh, fetch-webrtc.sh, make-icon.swift
 | [ws](https://github.com/websockets/ws) | MIT | room server WebSocket |
 | Apple SF Symbols | Apple's terms, via the system | icons in the app |
 
-No GPL or LGPL code is linked into the app.
+The full notices are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), which
+is also copied into the app (SameSofa ▸ Acknowledgements…).
+
+## Disclaimer
+
+In short (details in [DISCLAIMER.md](DISCLAIMER.md)):
+
+- SameSofa is provided as is, with no warranty and no support. Use it at your
+  own risk.
+- The project offers no hosted service; the placeholder server address is not a
+  service. You run your own room server and are responsible for it.
+- You are solely responsible for the films you share and for having the right
+  to share them with the other person. SameSofa is for watching your own media
+  with one other person; it does nothing to get around DRM and can't open
+  DRM-protected files.
+- Camera and microphone are used only for the call, peer to peer. Nothing is
+  recorded or collected by the project.
+- SameSofa isn't affiliated with or endorsed by any streaming or watch-party
+  product or company; product names are trademarks of their owners.
+- Security issues: report them privately via GitHub (Security tab ▸ Report a
+  vulnerability) or open an issue; there is no guaranteed response time.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are accepted under MIT-0
+(inbound = outbound).
 
 ## Licence
 
-MIT, see [LICENSE](LICENSE).
+[MIT-0](LICENSE) (MIT No Attribution): use, copy, modify and redistribute
+freely, no attribution required. Third-party parts keep their own licences (see
+above).

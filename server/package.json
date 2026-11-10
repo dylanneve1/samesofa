@@ -4,7 +4,7 @@
   "private": true,
   "description": "Tiny WebSocket room server that pairs two SameSofa apps and relays WebRTC signalling.",
   "main": "server.js",
-  "license": "MIT",
+  "license": "MIT-0",
   "scripts": {
     "start": "node server.js",
     "test": "node --test"

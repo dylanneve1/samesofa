@@ -31,6 +31,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resourc
 cp "$BIN_DIR/SameSofa" "$APP/Contents/MacOS/SameSofa"
 ditto Vendor/WebRTC.xcframework/macos-x86_64_arm64/WebRTC.framework "$APP/Contents/Frameworks/WebRTC.framework"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp LICENSE THIRD-PARTY-NOTICES.md "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -50,6 +51,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>LSMinimumSystemVersion</key><string>14.0</string>
 	<key>LSApplicationCategoryType</key><string>public.app-category.entertainment</string>
 	<key>NSHighResolutionCapable</key><true/>
+	<key>NSHumanReadableCopyright</key><string>Copyright © 2026 SameSofa contributors. MIT-0 licence. Provided as is, without warranty.</string>
 	<key>NSCameraUsageDescription</key><string>SameSofa shows your face to your partner in a little bubble while you watch.</string>
 	<key>NSMicrophoneUsageDescription</key><string>SameSofa lets you talk to your partner while you watch.</string>
 	<key>SameSofaDefaultServerURL</key><string>$SERVER_URL</string>
