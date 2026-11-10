@@ -53,12 +53,18 @@ public struct SyncEngine: Sendable {
     public private(set) var remoteBuffering = false
 
     // Tuning. Gaps under `deadband` are ignored; up to `seekThreshold` they are
-    // closed by playing up to `maxRateDelta` faster or slower; beyond that we seek.
+    // closed by playing a little faster or slower; beyond that we seek.
+    // The speed change is kept between `minRateDelta` and `maxRateDelta` (at
+    // most 1 %, a sixth of a semitone, and usually far less) so that it cannot
+    // be heard, and once started it continues down to `settleBand` so the
+    // speed does not flap around the edge of the deadband.
     public var deadband = 0.06
-    public var seekThreshold = 1.0
-    public var maxRateDelta = 0.04
+    public var settleBand = 0.015
+    public var seekThreshold = 0.35
+    public var maxRateDelta = 0.01
+    public var minRateDelta = 0.002
     /// Rate gain: seconds of drift -> rate offset.
-    public var gain = 0.15
+    public var gain = 0.1
     /// When starting from a pause, schedule the start this far in the future
     /// so the message reaches the other side before the film starts.
     public var startLead = 0.35
@@ -97,6 +103,13 @@ public struct SyncEngine: Sendable {
     public mutating func seek(to position: Double, now: Double) -> Timeline {
         let anchor = timeline.playing ? now + startLead : now
         return next(playing: timeline.playing, position: position, anchor: anchor)
+    }
+
+    /// Host only: its player is not where the timeline says (it slipped).
+    /// The timeline moves to the player, so the host, whose sound nobody
+    /// should hear change speed, never has to nudge; the guest follows.
+    public mutating func reanchor(now: Double, actualPosition: Double) -> Timeline {
+        next(playing: timeline.playing, position: actualPosition, anchor: now)
     }
 
     // MARK: Remote input
@@ -146,15 +159,16 @@ public struct SyncEngine: Sendable {
     }
 
     /// Compares the player's actual position with the timeline.
-    public func correction(actualPosition: Double, now: Double) -> PlayerCorrection {
+    /// `nudging`: the previous answer was `.adjustRate` (a correction is under way).
+    public func correction(actualPosition: Double, now: Double, nudging: Bool = false) -> PlayerCorrection {
         let target = targetPosition(at: now)
         guard effectivePlaying, now >= timeline.anchor else {
             return abs(actualPosition - target) > 0.04 ? .seek(to: target) : .none(rate: 0)
         }
         let drift = actualPosition - target // positive: we are ahead
         if abs(drift) >= seekThreshold { return .seek(to: target) }
-        if abs(drift) <= deadband { return .none(rate: 1) }
-        let delta = min(maxRateDelta, max(-maxRateDelta, -drift * gain * 4))
-        return .adjustRate(1 + delta)
+        if abs(drift) <= (nudging ? settleBand : deadband) { return .none(rate: 1) }
+        let delta = min(maxRateDelta, max(minRateDelta, abs(drift) * gain))
+        return .adjustRate(drift > 0 ? 1 - delta : 1 + delta)
     }
 }

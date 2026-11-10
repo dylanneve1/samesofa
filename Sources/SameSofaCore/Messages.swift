@@ -48,12 +48,19 @@ public struct FileInfo: Codable, Equatable, Sendable {
     /// Uniform type identifier, e.g. "public.mpeg-4".
     public var uti: String
     public var chunkSize: Int
+    /// Did the host have to re-encode the picture / the sound to make the
+    /// film playable? nil when the host's app is too old to say (before 1.2).
+    public var videoConverted: Bool?
+    public var audioConverted: Bool?
 
-    public init(size: Int64, name: String, uti: String, chunkSize: Int = ChunkFrame.defaultChunkSize) {
+    public init(size: Int64, name: String, uti: String, chunkSize: Int = ChunkFrame.defaultChunkSize,
+                videoConverted: Bool? = nil, audioConverted: Bool? = nil) {
         self.size = size
         self.name = name
         self.uti = uti
         self.chunkSize = chunkSize
+        self.videoConverted = videoConverted
+        self.audioConverted = audioConverted
     }
 
     public var chunkCount: Int { Int((size + Int64(chunkSize) - 1) / Int64(chunkSize)) }

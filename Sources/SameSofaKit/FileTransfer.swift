@@ -27,13 +27,15 @@ final class FileSender: NSObject, RTCDataChannelDelegate {
     let url: URL
 
     /// `name` is what the guest is told the film is called (defaults to the file name).
-    init(url: URL, name: String? = nil) throws {
+    /// `videoConverted`/`audioConverted`: whether the film had to be re-encoded, for the guest's readout.
+    init(url: URL, name: String? = nil, videoConverted: Bool? = nil, audioConverted: Bool? = nil) throws {
         throttleBytesPerSecond = ProcessInfo.processInfo.environment["SAMESOFA_THROTTLE_BPS"].flatMap(Double.init)
         self.url = url
         let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
         let uti = UTType(filenameExtension: url.pathExtension)?.identifier ?? UTType.mpeg4Movie.identifier
-        info = FileInfo(size: size, name: name ?? url.lastPathComponent, uti: uti)
+        info = FileInfo(size: size, name: name ?? url.lastPathComponent, uti: uti,
+                        videoConverted: videoConverted, audioConverted: audioConverted)
         handle = try FileHandle(forReadingFrom: url)
     }
 

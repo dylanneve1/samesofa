@@ -1,103 +1,162 @@
 import AVFoundation
+import CEchoCanceller
 import CWebRTCAudioDevice
+import os
+import SameSofaCore
 import WebRTC
 
-/// Single-producer single-consumer ring of interleaved stereo Float32 samples.
-/// The film's audio tap writes, the audio engine's render thread reads.
-final class StereoRing {
-    private var buffer: [Float]
-    private let capacityFrames: Int
-    private var writeIndex = 0 // frames
-    private var readIndex = 0
-    private let lock = NSLock() // only held for a few index updates
+/// Seconds on the host clock (the clock of `AudioTimeStamp.mHostTime` and of
+/// `CMClockGetHostTimeClock`).
+enum HostClock {
+    private static let secondsPerTick: Double = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return Double(info.numer) / Double(info.denom) / 1_000_000_000
+    }()
 
-    init(capacityFrames: Int) {
-        self.capacityFrames = capacityFrames
-        buffer = Array(repeating: 0, count: capacityFrames * 2)
+    static func seconds(_ ticks: UInt64) -> Double { Double(ticks) * secondsPerTick }
+    static var now: Double { seconds(mach_absolute_time()) }
+
+    static func seconds(_ timestamp: UnsafePointer<AudioTimeStamp>) -> Double {
+        timestamp.pointee.mFlags.contains(.hostTimeValid) && timestamp.pointee.mHostTime != 0
+            ? seconds(timestamp.pointee.mHostTime) : now
+    }
+}
+
+/// A short history of audio with a position on a timeline, written by one
+/// thread and read by another: the copy of the film's sound and of the other
+/// person's voice that the echo canceller is told about.
+final class TimedRing {
+    let channels: Int
+    private let capacity: Int
+    private let storage: UnsafeMutablePointer<Float>
+    private var end: Int64 = 0 // position one past the newest frame
+    private var count = 0 // frames held before `end`
+    private var anchorHost = 0.0
+    private var anchorPosition: Int64 = 0
+    private var hasAnchor = false
+    private let lock = OSAllocatedUnfairLock()
+
+    init(channels: Int, capacityFrames: Int) {
+        self.channels = channels
+        capacity = capacityFrames
+        storage = .allocate(capacity: capacityFrames * channels)
+        storage.initialize(repeating: 0, count: capacityFrames * channels)
     }
 
-    var availableFrames: Int {
-        lock.lock(); defer { lock.unlock() }
-        return writeIndex - readIndex
-    }
+    deinit { storage.deallocate() }
 
     func clear() {
-        lock.lock(); readIndex = writeIndex; lock.unlock()
+        lock.withLock { count = 0; hasAnchor = false }
     }
 
-    /// Writes frames; if the ring would overflow, the oldest audio is dropped.
-    func write(frames: Int, _ fill: (UnsafeMutablePointer<Float>, Int) -> Void) {
-        lock.lock()
-        let start = writeIndex
-        lock.unlock()
-        buffer.withUnsafeMutableBufferPointer { ptr in
+    /// Appends `frames` frames. `position` is where the first one sits on the
+    /// timeline (nil: right after the previous ones); a gap or a step back
+    /// drops what was there. `hostTime` is when the first frame is played,
+    /// for timelines that are read by clock time. `fill(destination, offset,
+    /// count)` writes `count` interleaved frames starting at source frame `offset`.
+    func append(frames: Int, position: Int64? = nil, hostTime: Double? = nil,
+                _ fill: (UnsafeMutablePointer<Float>, Int, Int) -> Void) {
+        guard frames > 0, frames <= capacity else { return }
+        lock.withLock {
+            if let position, abs(position - end) > 8 {
+                end = position
+                count = 0
+            }
+            if let hostTime {
+                anchorHost = hostTime
+                anchorPosition = end
+                hasAnchor = true
+            }
             var written = 0
             while written < frames {
-                let pos = (start + written) % capacityFrames
-                let run = min(frames - written, capacityFrames - pos)
-                fill(ptr.baseAddress! + pos * 2, run)
+                let slot = Int(((end + Int64(written)) % Int64(capacity) + Int64(capacity)) % Int64(capacity))
+                let run = min(frames - written, capacity - slot)
+                fill(storage + slot * channels, written, run)
                 written += run
             }
+            end += Int64(frames)
+            count = min(capacity, count + frames)
         }
-        lock.lock()
-        writeIndex = start + frames
-        if writeIndex - readIndex > capacityFrames { readIndex = writeIndex - capacityFrames }
-        lock.unlock()
     }
 
-    /// Reads up to `frames` into separate left/right buffers; pads with silence.
-    /// If more than `maxLatencyFrames` are queued, the excess is skipped so the
-    /// film's sound does not drift behind its picture.
-    func read(frames: Int, left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>, maxLatencyFrames: Int) {
-        lock.lock()
-        if writeIndex - readIndex > maxLatencyFrames + frames { readIndex = writeIndex - maxLatencyFrames }
-        let start = readIndex
-        let available = min(frames, writeIndex - readIndex)
-        readIndex += available
-        lock.unlock()
-        buffer.withUnsafeBufferPointer { ptr in
-            for i in 0..<available {
-                let pos = ((start + i) % capacityFrames) * 2
-                left[i] = ptr[pos]
-                right[i] = ptr[pos + 1]
+    /// Timeline position being played at host time `time`, from the latest
+    /// append that carried a host time.
+    func position(atHostTime time: Double, sampleRate: Double) -> Double? {
+        lock.withLock { hasAnchor ? Double(anchorPosition) + (time - anchorHost) * sampleRate : nil }
+    }
+
+    /// Adds `frames` samples to `left`/`right`, reading from fractional
+    /// position `start` and advancing `step` per sample (linear
+    /// interpolation). Parts outside what the ring holds add nothing.
+    /// Returns false when the read ran past the newest audio (it asked for
+    /// sound that has not arrived yet).
+    @discardableResult
+    func mix(start: Double, step: Double, frames: Int, gain: Float,
+             left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>) -> Bool {
+        lock.withLock {
+            guard count > 0 else { return true }
+            let complete = Int64((start + Double(frames) * step).rounded(.up)) + 1 < end
+            let first = end - Int64(count)
+            let cap = Int64(capacity)
+            for i in 0..<frames {
+                let p = start + Double(i) * step
+                let whole = p.rounded(.down)
+                let index = Int64(whole)
+                guard index >= first, index + 1 < end else { continue }
+                let fraction = Float(p - whole)
+                let a = Int(((index % cap) + cap) % cap) * channels
+                let b = Int((((index + 1) % cap) + cap) % cap) * channels
+                let l = storage[a] + (storage[b] - storage[a]) * fraction
+                if channels >= 2 {
+                    let r = storage[a + 1] + (storage[b + 1] - storage[a + 1]) * fraction
+                    left[i] += l * gain
+                    right[i] += r * gain
+                } else {
+                    left[i] += l * gain
+                    right[i] += l * gain
+                }
             }
+            return complete
         }
-        for i in available..<frames { left[i] = 0; right[i] = 0 }
     }
 }
 
 /// How the microphone and speakers are driven.
 public enum AudioMode: String, CaseIterable, Sendable {
-    /// Apple's voice processing (echo cancellation, noise suppression) on the
-    /// same audio engine that plays the film and the other person's voice, so
-    /// both are cancelled from the microphone.
-    case voiceProcessing
-    /// No voice processing: best sound, but needs headphones.
-    case headphones
+    /// Real microphone and speakers.
+    case live
     /// No audio hardware at all. Generates a test tone as "microphone" and
     /// measures what arrives. Used by the integration test and screenshots.
     case synthetic
 }
 
-/// Owns the one audio engine of the app and acts as WebRTC's audio device.
+/// The call's audio, and WebRTC's audio device.
 ///
-/// WebRTC on macOS normally opens the microphone and speakers itself and
-/// knows nothing about the film playing in AVPlayer, so its echo canceller
-/// cannot remove the film from the microphone. Instead SameSofa plays the
-/// film's sound, the other person's voice and records the microphone through
-/// a single AVAudioEngine with Apple's voice processing enabled. Everything
-/// that engine plays is the echo reference, so both the film and the voice
-/// are cancelled before the microphone audio is handed to WebRTC.
+/// The film is not played here: AVPlayer plays it straight to the normal
+/// sound output, untouched, whether or not a call is running. This class
+/// plays the other person's voice and records the microphone through a plain
+/// AVAudioEngine (no Apple voice processing, which would also process and
+/// duck the film), and cleans the microphone with WebRTC's echo canceller
+/// (AEC3). WebRTC inside the call only knows the voice it plays, so SameSofa
+/// runs its own canceller instance and tells it everything the speakers
+/// play: the voice, and a copy of the film's sound taken from the player
+/// (FilmAudioTap) and lined up with the player's clock. With headphones the
+/// film is left out of the reference.
 public final class AudioHub: NSObject, RTCAudioDevice {
     public let mode: AudioMode
     static let rtcRate = 48_000.0
     static let rtcFrames10ms = 480
+    /// The reference runs this far ahead of the clock, so that what the
+    /// microphone hears always comes after what the canceller was told,
+    /// whatever the output's latency really is. AEC3 finds the exact delay.
+    static let referenceLead = 0.04
 
     private var engine: AVAudioEngine?
     private var voiceNode: AVAudioSourceNode?
-    private var filmNode: AVAudioSourceNode?
     private var sinkNode: AVAudioSinkNode?
     private var converter: AVAudioConverter?
+    private var configurationObserver: NSObjectProtocol?
     private var syntheticTimer: DispatchSourceTimer?
     private let syntheticQueue = DispatchQueue(label: "samesofa.audio.synthetic", qos: .userInteractive)
 
@@ -105,21 +164,56 @@ public final class AudioHub: NSObject, RTCAudioDevice {
     private var playoutBlock: RTCAudioDeviceGetPlayoutDataBlock?
     private var deliverBlock: RTCAudioDeviceDeliverRecordedDataBlock?
 
-    let filmRing = StereoRing(capacityFrames: 48_000 * 2)
-    private var filmRate: Double = 48_000
+    // The echo reference.
+    /// Stereo copy of the film's sound, positioned in film samples.
+    let filmReference = TimedRing(channels: 2, capacityFrames: 192_000)
+    private let voiceReference = TimedRing(channels: 1, capacityFrames: 48_000)
+    private let filmClockLock = OSAllocatedUnfairLock()
+    private var filmTimebase: CMTimebase?
+    private var filmRate = 48_000.0
+    private var filmCursor = ReferenceCursor(sampleRate: 48_000)
+    private var voiceCursor = ReferenceCursor(sampleRate: 48_000)
+    private var canceller: OpaquePointer?
+    private var referenceLeft = [Float](repeating: 0, count: 480)
+    private var referenceRight = [Float](repeating: 0, count: 480)
+    private var captureQueue = [Float](repeating: 0, count: 48_000)
+    private var captureQueued = 0
+    private var cancelFilm = true
+    /// How much later than planned the film reference is read, because the
+    /// player delivers its sound later than expected (seconds, grows only).
+    private var filmLeadTrim = 0.0
+    /// How often that happened (diagnostics).
+    public private(set) var filmReferenceLate = 0
 
-    // Volumes, settable from the UI (0...1).
-    public var filmVolume: Float = 1 { didSet { filmNode?.volume = filmVolume } }
+    /// Film volume (0...1). The player applies it; here it scales the echo reference.
+    public var filmVolume: Float = 1
     public var voiceVolume: Float = 1 { didSet { voiceNode?.volume = voiceVolume } }
     /// When true the microphone sends silence.
     public var micMuted = false
+    /// "Automatic" follows the output device; the other two override it.
+    public var echoSetting: EchoSetting = .automatic { didSet { updateRoute() } }
+    /// The sound output in use (checked every second while live).
+    public private(set) var outputRoute = OutputRoute.unknown
+    /// Called on the main thread when `outputRoute` or `cancelsFilmEcho` changes.
+    public var onRouteChange: (() -> Void)?
+    /// Is the film's sound being removed from the microphone?
+    public var cancelsFilmEcho: Bool { mode == .live && cancelFilm && filmClockLock.withLock { filmTimebase != nil } }
+    /// Should the player let the hub listen to the film? Only when the film
+    /// has to be removed from the microphone (speakers); with headphones the
+    /// player's sound path has nothing of ours in it at all.
+    public var wantsFilmReference: Bool { mode == .synthetic || cancelFilm }
+    /// A call is running and the microphone is being cleaned.
+    public var microphoneActive: Bool { mode == .live && _recording && sinkNode != nil && engine?.isRunning == true }
+    private var routeTimer: Timer?
 
     // Diagnostics (read from any thread; approximate).
     public private(set) var receivedVoiceLevel: Float = 0
-    /// Peak level of the film's sound being played (decays), for tests.
-    public private(set) var filmLevel: Float = 0
+    /// Peak level of the film's sound (decays), for tests.
+    public internal(set) var filmLevel: Float = 0
     public private(set) var sentFrames = 0
     public private(set) var engineError: String?
+    /// How often the engine was rebuilt after a device change.
+    public private(set) var engineRestarts = 0
 
     private var _initialized = false
     private var _playoutInitialized = false
@@ -132,6 +226,40 @@ public final class AudioHub: NSObject, RTCAudioDevice {
     public init(mode: AudioMode) {
         self.mode = mode
         super.init()
+        if mode == .live {
+            updateRoute()
+            let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.updateRoute() }
+            RunLoop.main.add(timer, forMode: .common)
+            routeTimer = timer
+        }
+    }
+
+    deinit {
+        routeTimer?.invalidate()
+        if let canceller { SSEchoCancellerDestroy(canceller) }
+    }
+
+    private func updateRoute() {
+        guard mode == .live else { return }
+        let route = OutputDevice.currentRoute()
+        let cancel = echoSetting.cancelsFilmEcho(on: route)
+        guard route != outputRoute || cancel != cancelFilm else { return }
+        outputRoute = route
+        cancelFilm = cancel
+        onRouteChange?()
+    }
+
+    // MARK: The film's clock (set by PlaybackController)
+
+    /// The clock of the film being played, or nil when there is none.
+    func setFilmTimebase(_ timebase: CMTimebase?) {
+        filmClockLock.withLock { filmTimebase = timebase }
+        if timebase == nil { filmReference.clear() }
+    }
+
+    /// The film's sample rate became known (from the audio tap).
+    func filmFormatChanged(sampleRate: Double) {
+        filmClockLock.withLock { filmRate = sampleRate }
     }
 
     // MARK: RTCAudioDevice: fixed 48 kHz mono 16-bit on the WebRTC side.
@@ -183,64 +311,44 @@ public final class AudioHub: NSObject, RTCAudioDevice {
     }
     public func stopRecording() -> Bool { _recording = false; return true }
 
-    // MARK: Engine
+    // MARK: Engine (the call's voice out, the microphone in)
 
-    /// Starts the engine (idempotent). Called when the film or the call needs sound.
+    /// Starts the call's audio (idempotent). The film does not need it.
     public func start() {
         if mode == .synthetic { startSynthetic(); return }
         if let engine, engine.isRunning { return }
-        if mode == .voiceProcessing, !voiceProcessingFailed {
-            if let error = startEngine(voiceProcessing: true) {
-                // E.g. no microphone, or an audio device voice processing can't drive.
-                // Better to have the film and the voice without echo cancellation than nothing.
-                NSLog("SameSofa: voice processing unavailable (\(error)); continuing without it")
-                voiceProcessingFailed = true
-                teardownEngine()
-            } else {
-                return
-            }
-        }
-        if let error = startEngine(voiceProcessing: false) {
+        teardownEngine()
+        if let error = startEngine() {
             engineError = "\(error)"
             NSLog("SameSofa audio engine failed: \(error)")
             teardownEngine()
         }
     }
 
-    /// True when echo cancellation was requested but could not be started.
-    public private(set) var voiceProcessingFailed = false
-    /// Whether Apple voice processing is actually active right now.
-    public var voiceProcessingActive: Bool { mode == .voiceProcessing && !voiceProcessingFailed && engine?.isRunning == true }
-
     private func teardownEngine() {
+        if let configurationObserver { NotificationCenter.default.removeObserver(configurationObserver) }
+        configurationObserver = nil
         engine?.stop()
         engine = nil
         voiceNode = nil
-        filmNode = nil
         sinkNode = nil
         converter = nil
+        // The engine has stopped calling back, so nothing is using these.
+        if let canceller { SSEchoCancellerDestroy(canceller) }
+        canceller = nil
+        captureQueued = 0
+        voiceReference.clear()
+        voiceCursor.reset()
+        filmCursor.reset()
     }
 
-    private struct NoMicrophone: Error, CustomStringConvertible {
-        var description: String { "no microphone connected" }
-    }
-
-    private func startEngine(voiceProcessing: Bool) -> Error? {
+    private func startEngine() -> Error? {
         // Touching AVAudioEngine.inputNode without any input device raises an
         // Objective-C exception, so check first.
         let hasMicrophone = AVCaptureDevice.default(for: .audio) != nil
-        if voiceProcessing && !hasMicrophone { return NoMicrophone() }
         let engine = AVAudioEngine()
         self.engine = engine
         do {
-            let input: AVAudioInputNode? = hasMicrophone ? engine.inputNode : nil
-            if voiceProcessing, let input {
-                try input.setVoiceProcessingEnabled(true)
-                // Do not turn other apps (or our own film) down while talking.
-                input.voiceProcessingOtherAudioDuckingConfiguration =
-                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
-            }
-
             let mono = AVAudioFormat(standardFormatWithSampleRate: Self.rtcRate, channels: 1)!
             let voice = AVAudioSourceNode(format: mono) { [weak self] _, timestamp, frames, abl in
                 self?.renderVoice(frames: Int(frames), timestamp: timestamp, abl: abl) ?? noErr
@@ -250,19 +358,27 @@ public final class AudioHub: NSObject, RTCAudioDevice {
             engine.connect(voice, to: engine.mainMixerNode, format: mono)
             voiceNode = voice
 
-            attachFilmNode(to: engine, rate: filmRate)
-
-            if let input, input.inputFormat(forBus: 0).sampleRate > 0, input.inputFormat(forBus: 0).channelCount > 0,
-               case let inputFormat = input.outputFormat(forBus: 0), inputFormat.sampleRate > 0, inputFormat.channelCount > 0 {
-                let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Self.rtcRate, channels: 1, interleaved: true)!
-                converter = AVAudioConverter(from: inputFormat, to: target)
-                let sink = AVAudioSinkNode { [weak self] timestamp, frames, abl in
-                    self?.captured(frames: frames, timestamp: timestamp, abl: abl, format: inputFormat) ?? noErr
+            if hasMicrophone {
+                let input = engine.inputNode
+                InputDevice.preferBuiltInOverBluetooth(for: input)
+                let inputFormat = input.outputFormat(forBus: 0)
+                if inputFormat.sampleRate > 0, inputFormat.channelCount > 0 {
+                    converter = AVAudioConverter(from: inputFormat, to: mono)
+                    canceller = SSEchoCancellerCreate(1, 1, 1)
+                    let sink = AVAudioSinkNode { [weak self] timestamp, frames, abl in
+                        self?.captured(frames: frames, timestamp: timestamp, abl: abl, format: inputFormat) ?? noErr
+                    }
+                    engine.attach(sink)
+                    engine.connect(input, to: sink, format: inputFormat)
+                    sinkNode = sink
                 }
-                engine.attach(sink)
-                engine.connect(input, to: sink, format: inputFormat)
-                sinkNode = sink
             }
+            // Plugging in headphones, AirPods connecting, a new default device:
+            // the engine stops itself and has to be rebuilt. The film is not
+            // part of it and plays on.
+            configurationObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+            ) { [weak self] _ in self?.engineConfigurationChanged() }
             engine.prepare()
             try engine.start()
             engineError = nil
@@ -272,60 +388,65 @@ public final class AudioHub: NSObject, RTCAudioDevice {
         }
     }
 
+    private func engineConfigurationChanged() {
+        guard mode == .live, engine != nil else { return }
+        engineRestarts += 1
+        teardownEngine()
+        updateRoute()
+        if _playing || _recording { start() }
+    }
+
+    /// Test hook: the echo reference (10 ms, 480 frames per channel) for a
+    /// microphone block recorded at host time `time`, and the film position
+    /// (seconds) the film's clock showed at that moment.
+    public func referenceForTesting(atHostTime time: Double) -> (left: [Float], right: [Float], filmTime: Double?) {
+        var left = [Float](repeating: 0, count: Self.rtcFrames10ms), right = left
+        var filmTime: Double?
+        if let timebase = filmClockLock.withLock({ filmTimebase }) {
+            filmTime = CMTimebaseGetTime(timebase).seconds + (time - HostClock.now) * CMTimebaseGetRate(timebase)
+        }
+        left.withUnsafeMutableBufferPointer { l in
+            right.withUnsafeMutableBufferPointer { r in mixReference(at: time, left: l.baseAddress!, right: r.baseAddress!) }
+        }
+        return (left, right, filmTime)
+    }
+    /// Host clock in seconds, as used for `referenceForTesting`.
+    public static var hostClockNow: Double { HostClock.now }
+
+    /// Test hook: behave as if the sound devices had just changed.
+    public func simulateDeviceChange() { engineConfigurationChanged() }
+
     public func stop() {
         teardownEngine()
         syntheticTimer?.cancel()
         syntheticTimer = nil
     }
 
-    private func attachFilmNode(to engine: AVAudioEngine, rate: Double) {
-        if let old = filmNode { engine.detach(old) }
-        let stereo = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 2)!
-        let maxLatency = Int(rate * 0.05)
-        let ring = filmRing
-        let node = AVAudioSourceNode(format: stereo) { [weak self] _, _, frames, abl in
-            let buffers = UnsafeMutableAudioBufferListPointer(abl)
-            guard buffers.count >= 2,
-                  let left = buffers[0].mData?.assumingMemoryBound(to: Float.self),
-                  let right = buffers[1].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
-            ring.read(frames: Int(frames), left: left, right: right, maxLatencyFrames: maxLatency)
-            self?.meterFilm(left: left, right: right, frames: Int(frames))
-            return noErr
-        }
-        node.volume = filmVolume
-        engine.attach(node)
-        engine.connect(node, to: engine.mainMixerNode, format: stereo)
-        filmNode = node
-    }
-
-    /// The film's sample rate became known (from the audio tap).
-    func filmFormatChanged(sampleRate: Double) {
-        DispatchQueue.main.async {
-            guard sampleRate != self.filmRate else { return }
-            self.filmRate = sampleRate
-            if let engine = self.engine, self.mode != .synthetic { self.attachFilmNode(to: engine, rate: sampleRate) }
-        }
-    }
-
     private func renderVoice(frames: Int, timestamp: UnsafePointer<AudioTimeStamp>, abl: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
         let out = UnsafeMutableAudioBufferListPointer(abl)
         guard let dst = out.first?.mData?.assumingMemoryBound(to: Float.self) else { return noErr }
-        guard _playing, let playoutBlock, frames <= scratchInt16.count else {
-            for i in 0..<frames { dst[i] = 0 }
-            return noErr
-        }
-        scratchInt16.withUnsafeMutableBufferPointer { scratch in
-            var list = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(
-                mNumberChannels: 1, mDataByteSize: UInt32(frames * 2), mData: UnsafeMutableRawPointer(scratch.baseAddress)))
-            var flags = AudioUnitRenderActionFlags()
-            _ = playoutBlock(&flags, timestamp, 0, UInt32(frames), &list)
-            var peak: Float = 0
-            for i in 0..<frames {
-                let v = Float(scratch[i]) / 32768
-                dst[i] = v
-                peak = max(peak, abs(v))
+        if _playing, let playoutBlock, frames <= scratchInt16.count {
+            scratchInt16.withUnsafeMutableBufferPointer { scratch in
+                var list = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(
+                    mNumberChannels: 1, mDataByteSize: UInt32(frames * 2), mData: UnsafeMutableRawPointer(scratch.baseAddress)))
+                var flags = AudioUnitRenderActionFlags()
+                _ = playoutBlock(&flags, timestamp, 0, UInt32(frames), &list)
+                var peak: Float = 0
+                for i in 0..<frames {
+                    let v = Float(scratch[i]) / 32768
+                    dst[i] = v
+                    peak = max(peak, abs(v))
+                }
+                receivedVoiceLevel = max(peak, receivedVoiceLevel * 0.95)
             }
-            receivedVoiceLevel = max(peak, receivedVoiceLevel * 0.95)
+        } else {
+            for i in 0..<frames { dst[i] = 0 }
+        }
+        if mode == .live {
+            // Remember what the speakers are about to play, and when.
+            voiceReference.append(frames: frames, hostTime: HostClock.seconds(timestamp)) { destination, offset, count in
+                memcpy(destination, dst + offset, count * MemoryLayout<Float>.size)
+            }
         }
         return noErr
     }
@@ -333,7 +454,7 @@ public final class AudioHub: NSObject, RTCAudioDevice {
     private var convertOut: AVAudioPCMBuffer?
 
     private func captured(frames: AVAudioFrameCount, timestamp: UnsafePointer<AudioTimeStamp>, abl: UnsafePointer<AudioBufferList>, format: AVAudioFormat) -> OSStatus {
-        guard _recording, let deliverBlock, let converter,
+        guard _recording, let converter,
               let input = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: abl, deallocator: nil) else { return noErr }
         input.frameLength = frames
         let capacity = AVAudioFrameCount(Double(frames) * Self.rtcRate / format.sampleRate) + 32
@@ -349,20 +470,85 @@ public final class AudioHub: NSObject, RTCAudioDevice {
             status.pointee = .haveData
             return input
         }
-        guard out.frameLength > 0, let samples = out.int16ChannelData?[0] else { return noErr }
-        if micMuted { memset(samples, 0, Int(out.frameLength) * 2) }
-        var list = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(
-            mNumberChannels: 1, mDataByteSize: out.frameLength * 2, mData: UnsafeMutableRawPointer(samples)))
-        var flags = AudioUnitRenderActionFlags()
-        _ = deliverBlock(&flags, timestamp, 1, out.frameLength, &list, nil, nil)
-        sentFrames += Int(out.frameLength)
+        let produced = Int(out.frameLength)
+        guard produced > 0, let samples = out.floatChannelData?[0] else { return noErr }
+        // When the oldest queued sample was recorded.
+        let queueStart = HostClock.seconds(timestamp) - Double(captureQueued) / Self.rtcRate
+        captureQueue.withUnsafeMutableBufferPointer { queue in
+            guard let base = queue.baseAddress, captureQueued + produced <= queue.count else { captureQueued = 0; return }
+            memcpy(base + captureQueued, samples, produced * MemoryLayout<Float>.size)
+            captureQueued += produced
+            var done = 0
+            while captureQueued - done >= Self.rtcFrames10ms {
+                processCapturedBlock(base + done, recordedAt: queueStart + Double(done) / Self.rtcRate)
+                done += Self.rtcFrames10ms
+            }
+            if done > 0 {
+                captureQueued -= done
+                memmove(base, base + done, captureQueued * MemoryLayout<Float>.size)
+            }
+        }
         return noErr
     }
 
-    private func meterFilm(left: UnsafePointer<Float>, right: UnsafePointer<Float>, frames: Int) {
-        var peak: Float = 0
-        for i in 0..<frames { peak = max(peak, abs(left[i]), abs(right[i])) }
-        filmLevel = max(peak, filmLevel * 0.97)
+    /// One 10 ms block of microphone audio: remove what the speakers played, hand it to WebRTC.
+    private func processCapturedBlock(_ block: UnsafeMutablePointer<Float>, recordedAt time: Double) {
+        let frames = Self.rtcFrames10ms
+        if let canceller {
+            referenceLeft.withUnsafeMutableBufferPointer { left in
+                referenceRight.withUnsafeMutableBufferPointer { right in
+                    memset(left.baseAddress!, 0, frames * MemoryLayout<Float>.size)
+                    memset(right.baseAddress!, 0, frames * MemoryLayout<Float>.size)
+                    mixReference(at: time, left: left.baseAddress!, right: right.baseAddress!)
+                    SSEchoCancellerAnalyzeRender(canceller, left.baseAddress!, right.baseAddress!)
+                }
+            }
+            SSEchoCancellerProcessCapture(canceller, block)
+        }
+        guard let deliverBlock else { return }
+        scratchInt16.withUnsafeMutableBufferPointer { scratch in
+            if micMuted {
+                memset(scratch.baseAddress!, 0, frames * 2)
+            } else {
+                for i in 0..<frames { scratch[i] = Int16(max(-32768, min(32767, block[i] * 32768))) }
+            }
+            var list = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(
+                mNumberChannels: 1, mDataByteSize: UInt32(frames * 2), mData: UnsafeMutableRawPointer(scratch.baseAddress)))
+            var flags = AudioUnitRenderActionFlags()
+            var stamp = AudioTimeStamp()
+            stamp.mSampleTime = Double(sentFrames)
+            stamp.mFlags = .sampleTimeValid
+            _ = deliverBlock(&flags, &stamp, 1, UInt32(frames), &list, nil, nil)
+        }
+        sentFrames += frames
+    }
+
+    /// Adds everything the speakers play around host time `time` to the reference block.
+    func mixReference(at time: Double, left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>) {
+        let frames = Self.rtcFrames10ms
+        let target = time + Self.referenceLead
+        if let desired = voiceReference.position(atHostTime: target, sampleRate: Self.rtcRate) {
+            let read = voiceCursor.next(desired: desired, step: 1, frames: frames)
+            voiceReference.mix(start: read.start, step: read.step, frames: frames, gain: voiceVolume, left: left, right: right)
+        } else {
+            voiceCursor.reset()
+        }
+        let (timebase, rate) = filmClockLock.withLock { (filmTimebase, filmRate) }
+        guard cancelFilm, let timebase else { filmCursor.reset(); return }
+        let speed = CMTimebaseGetRate(timebase)
+        let now = HostClock.now
+        let media = CMTimebaseGetTime(timebase).seconds
+        guard speed > 0, media.isFinite else { filmCursor.reset(); return }
+        filmCursor.sampleRate = rate
+        let desired = (media + (target - filmLeadTrim - now) * speed) * rate
+        let read = filmCursor.next(desired: desired, step: speed * rate / Self.rtcRate, frames: frames)
+        let arrived = filmReference.mix(start: read.start, step: read.step, frames: frames, gain: filmVolume, left: left, right: right)
+        if !arrived, filmLeadTrim < 0.2 {
+            // Asked for film sound the player has not handed over yet: read a
+            // little later from now on (the canceller re-finds the delay).
+            filmLeadTrim += 0.01
+            filmReferenceLate += 1
+        }
     }
 
     // MARK: Synthetic mode (tests and screenshots): no microphone, no speakers.
@@ -371,8 +557,6 @@ public final class AudioHub: NSObject, RTCAudioDevice {
         guard syntheticTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(flags: .strict, queue: syntheticQueue)
         timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(1))
-        var left = [Float](repeating: 0, count: 4096)
-        var right = [Float](repeating: 0, count: 4096)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             var ts = AudioTimeStamp()
@@ -387,14 +571,6 @@ public final class AudioHub: NSObject, RTCAudioDevice {
                     abl.pointee = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(
                         mNumberChannels: 1, mDataByteSize: UInt32(frames * 4), mData: UnsafeMutableRawPointer(fp.baseAddress)))
                     _ = self.renderVoice(frames: frames, timestamp: &ts, abl: abl)
-                }
-            }
-            // Drain the film ring as the real engine would.
-            left.withUnsafeMutableBufferPointer { l in
-                right.withUnsafeMutableBufferPointer { r in
-                    let filmFrames = min(Int(Double(frames) * self.filmRate / Self.rtcRate), l.count)
-                    self.filmRing.read(frames: filmFrames, left: l.baseAddress!, right: r.baseAddress!, maxLatencyFrames: Int(self.filmRate * 0.05))
-                    self.meterFilm(left: l.baseAddress!, right: r.baseAddress!, frames: filmFrames)
                 }
             }
             // "Microphone": a quiet 440 Hz tone.

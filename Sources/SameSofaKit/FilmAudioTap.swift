@@ -1,24 +1,43 @@
 import AVFoundation
 import CAudioTap
 import MediaToolbox
+import SameSofaCore
 
-/// Pulls the film's decoded audio out of AVPlayer (MTAudioProcessingTap),
-/// hands it to the AudioHub so it plays through the same engine as the call,
-/// and silences AVPlayer's own output.
+/// Listens to the film's decoded sound inside AVPlayer (MTAudioProcessingTap)
+/// without changing it: the player goes on to play exactly what it decoded
+/// through the normal sound output. The copy taken here, folded down to
+/// stereo and stamped with its position in the film, is the echo canceller's
+/// reference for "what the speakers are playing".
 final class FilmAudioTap {
     private final class Context {
-        let ring: StereoRing
         weak var hub: AudioHub?
+        let ring: TimedRing
+        /// Left/right share of each source channel, from the track's channel layout.
+        let layoutGains: [StereoGain]?
+        var gains: [StereoGain] = []
         var channels = 2
         var nonInterleaved = true
         var isFloat = true
-        var writeOffset = 0
-        init(ring: StereoRing, hub: AudioHub) { self.ring = ring; self.hub = hub }
+        var sampleRate = 48_000.0
+        /// Test hook: receives every buffer exactly as the player will play it.
+        let monitor: FilmAudioTap.Monitor?
+        init(hub: AudioHub, layoutGains: [StereoGain]?, monitor: FilmAudioTap.Monitor?) {
+            self.hub = hub
+            ring = hub.filmReference
+            self.layoutGains = layoutGains
+            self.monitor = monitor
+        }
     }
 
-    /// Builds an audio mix that routes `track` through `hub`.
-    static func audioMix(for track: AVAssetTrack, hub: AudioHub) -> AVAudioMix? {
-        let context = Context(ring: hub.filmRing, hub: hub)
+    static let labelOffsetFrames: Int64 = 48
+
+    /// Called on the player's audio thread with (buffers, frames, channels, position in frames or nil).
+    typealias Monitor = (UnsafeMutableAudioBufferListPointer, Int, Int, Int64?) -> Void
+
+    /// Builds an audio mix whose only job is to let `hub` listen to `track`.
+    /// `roles`: what each channel is, in track order (nil if unknown).
+    static func audioMix(for track: AVAssetTrack, roles: [ChannelRole]?, hub: AudioHub, monitor: Monitor? = nil) -> AVAudioMix? {
+        let context = Context(hub: hub, layoutGains: roles.map(Downmix.stereoGains(for:)), monitor: monitor)
         var callbacks = MTAudioProcessingTapCallbacks(
             version: kMTAudioProcessingTapCallbacksVersion_0,
             clientInfo: UnsafeMutableRawPointer(Unmanaged.passRetained(context).toOpaque()),
@@ -34,6 +53,12 @@ final class FilmAudioTap {
                 context.channels = Int(asbd.mChannelsPerFrame)
                 context.nonInterleaved = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
                 context.isFloat = asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0 && asbd.mBitsPerChannel == 32
+                context.sampleRate = asbd.mSampleRate
+                if let layout = context.layoutGains, layout.count == context.channels {
+                    context.gains = layout
+                } else {
+                    context.gains = Downmix.stereoGains(for: Downmix.assumedRoles(channelCount: context.channels))
+                }
                 context.ring.clear()
                 context.hub?.filmFormatChanged(sampleRate: asbd.mSampleRate)
             },
@@ -42,18 +67,24 @@ final class FilmAudioTap {
                 context.ring.clear()
             },
             process: { tap, frameCount, _, bufferList, framesOut, flagsOut in
-                let status = MTAudioProcessingTapGetSourceAudio(tap, frameCount, bufferList, flagsOut, nil, framesOut)
+                var range = CMTimeRange.invalid
+                let status = MTAudioProcessingTapGetSourceAudio(tap, frameCount, bufferList, flagsOut, &range, framesOut)
                 guard status == noErr else { return }
+                // From here on the buffers are only read: what the player plays is what it decoded.
                 let context = Unmanaged<Context>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
                 let frames = Int(framesOut.pointee)
+                guard context.isFloat, frames > 0 else { return }
+                // The player labels each buffer with the time of the one before
+                // it (measured on every format tried: the sound in a buffer is
+                // exactly one buffer plus 48 samples later in the film than its
+                // label says). The true position is what matters for lining
+                // the echo reference up with the film's clock.
+                let start = range.start.seconds
+                let position: Int64? = range.start.isNumeric && start.isFinite
+                    ? Int64((start * context.sampleRate).rounded()) + Int64(frames) + FilmAudioTap.labelOffsetFrames : nil
                 let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
-                if context.isFloat, frames > 0 {
-                    FilmAudioTap.copy(buffers: buffers, frames: frames, context: context)
-                }
-                // AVPlayer's own output goes silent; the AudioHub plays the film instead.
-                for buffer in buffers {
-                    if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
-                }
+                FilmAudioTap.copy(buffers: buffers, frames: frames, position: position, context: context)
+                context.monitor?(buffers, frames, context.channels, position)
             }
         )
         guard let tap = SSAudioTapCreate(&callbacks) else {
@@ -67,40 +98,47 @@ final class FilmAudioTap {
         return mix
     }
 
-    /// Downmixes whatever the film has to stereo and writes it into the ring.
-    private static func copy(buffers: UnsafeMutableAudioBufferListPointer, frames: Int, context: Context) {
+    /// Folds the film's channels down to stereo and stores them for the echo canceller.
+    private static func copy(buffers: UnsafeMutableAudioBufferListPointer, frames: Int, position: Int64?, context: Context) {
         let channels = context.channels
-        func sample(_ channel: Int, _ frame: Int) -> Float {
-            if context.nonInterleaved {
-                guard channel < buffers.count, let data = buffers[channel].mData else { return 0 }
-                return data.assumingMemoryBound(to: Float.self)[frame]
-            }
-            guard let data = buffers[0].mData else { return 0 }
-            return data.assumingMemoryBound(to: Float.self)[frame * channels + channel]
-        }
-        context.ring.write(frames: frames) { dst, count in
-            // `write` may call us in two runs when it wraps; track the offset.
-            let base = context.writeOffset
-            for i in 0..<count {
-                let f = base + i
-                var l: Float, r: Float
-                switch channels {
-                case 1:
-                    l = sample(0, f); r = l
-                case 6:
-                    // L R C LFE Ls Rs -> stereo, keeping dialogue (centre) audible.
-                    let c = sample(2, f) * 0.707
-                    l = sample(0, f) + c + sample(4, f) * 0.707
-                    r = sample(1, f) + c + sample(5, f) * 0.707
-                    l *= 0.6; r *= 0.6
-                default:
-                    l = sample(0, f); r = sample(1, f)
+        let gains = context.gains
+        var peak: Float = 0
+        context.ring.append(frames: frames, position: position) { destination, offset, count in
+            memset(destination, 0, count * 2 * MemoryLayout<Float>.size)
+            for channel in 0..<min(channels, gains.count) {
+                let gain = gains[channel]
+                guard gain.left != 0 || gain.right != 0 else { continue }
+                let source: UnsafePointer<Float>
+                let stride: Int
+                if context.nonInterleaved {
+                    guard channel < buffers.count, let data = buffers[channel].mData else { continue }
+                    source = UnsafePointer(data.assumingMemoryBound(to: Float.self)) + offset
+                    stride = 1
+                } else {
+                    guard let data = buffers[0].mData else { continue }
+                    source = UnsafePointer(data.assumingMemoryBound(to: Float.self)) + offset * channels + channel
+                    stride = channels
                 }
-                dst[i * 2] = l
-                dst[i * 2 + 1] = r
+                for i in 0..<count {
+                    let sample = source[i * stride]
+                    destination[i * 2] += sample * gain.left
+                    destination[i * 2 + 1] += sample * gain.right
+                }
             }
-            context.writeOffset += count
+            for i in 0..<(count * 2) { peak = max(peak, abs(destination[i])) }
         }
-        context.writeOffset = 0
+        if let hub = context.hub { hub.filmLevel = max(peak, hub.filmLevel * 0.9) }
+    }
+}
+
+/// For tests that render the film's sound path offline.
+public enum FilmListening {
+    /// The audio mix SameSofa attaches to a film's sound track while it plays.
+    public static func audioMix(for track: AVAssetTrack, hub: AudioHub, monitor: FilmAudioMonitor? = nil) async -> AVAudioMix? {
+        var roles: [ChannelRole]?
+        if let format = (try? await track.load(.formatDescriptions))?.first {
+            roles = ChannelLayoutReader.roles(for: format)
+        }
+        return FilmAudioTap.audioMix(for: track, roles: roles, hub: hub, monitor: monitor)
     }
 }

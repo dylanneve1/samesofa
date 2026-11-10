@@ -12,18 +12,26 @@ public struct Preparing: Equatable {
     public var remuxOnly: Bool
     /// Times real time, when known.
     public var speed: Double?
+    /// The film's timing information is damaged and is being rebuilt (or,
+    /// if that failed, the picture is being re-encoded because of it).
+    public var repairingTiming = false
 }
 
 public struct PartySettings {
     public var serverURL: URL
     public var ice: IceSettings
     public var audioMode: AudioMode
+    /// Cancel the film from the microphone: automatic (unless headphones), always, never.
+    public var echo: EchoSetting
+    /// Leave spatial audio to the system instead of playing a plain downmix.
+    public var systemSpatialAudio = false
     public var camera: CameraSource
 
-    public init(serverURL: URL, ice: IceSettings = IceSettings(), audioMode: AudioMode = .voiceProcessing, camera: CameraSource = .camera) {
+    public init(serverURL: URL, ice: IceSettings = IceSettings(), audioMode: AudioMode = .live, echo: EchoSetting = .automatic, camera: CameraSource = .camera) {
         self.serverURL = serverURL
         self.ice = ice
         self.audioMode = audioMode
+        self.echo = echo
         self.camera = camera
     }
 }
@@ -61,7 +69,9 @@ public final class Party: ObservableObject {
     @Published public private(set) var partnerMicOn = true
     @Published public var micOn = true { didSet { call?.setMicMuted(!micOn); sendMediaState() } }
     @Published public var cameraOn = true { didSet { cameraOn ? call?.startCamera() : call?.stopCamera(); sendMediaState() } }
-    @Published public var filmVolume: Float = 1 { didSet { hub.filmVolume = filmVolume } }
+    @Published public var filmVolume: Float = 1 { didSet { hub.filmVolume = filmVolume; playback.player.volume = filmVolume } }
+    /// The film as shared: on the host its own description, on the guest the host's.
+    @Published public private(set) var sharedFilm: FileInfo?
     @Published public var voiceVolume: Float = 1 { didSet { hub.voiceVolume = voiceVolume } }
 
     public let role: PeerRole
@@ -91,7 +101,13 @@ public final class Party: ObservableObject {
         self.role = role
         self.settings = settings
         hub = AudioHub(mode: settings.audioMode)
+        hub.echoSetting = settings.echo
         playback = PlaybackController(role: role, hub: hub)
+        hub.onRouteChange = { [weak self] in
+            self?.playback.soundOutputChanged()
+            self?.objectWillChange.send()
+        }
+        playback.systemSpatialAudio = settings.systemSpatialAudio
         playback.send = { [weak self] message in self?.control?.send(message) }
         // Re-publish the playback controller's changes so SwiftUI views observing the party update.
         playback.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
@@ -113,18 +129,19 @@ public final class Party: ObservableObject {
         filmName = film.deletingPathExtension().lastPathComponent
         switch check {
         case .shareAsIs:
-            try startSharing(film, name: film.lastPathComponent)
+            try startSharing(film, name: film.lastPathComponent, plan: nil)
         case .convert(let plan, let tools):
             guard FileManager.default.isReadableFile(atPath: film.path) else {
                 throw FilmPreparerError("Couldn't read that file.")
             }
             let preparer = FilmPreparer(input: film, plan: plan, tools: tools)
             self.preparer = preparer
-            preparing = Preparing(fraction: 0, remuxOnly: plan.isRemuxOnly, speed: nil)
+            preparing = Preparing(fraction: 0, remuxOnly: plan.isRemuxOnly, speed: nil, repairingTiming: plan.repairVideoTimestamps)
             preparer.onProgress = { [weak self, weak preparer] fraction, speed in
                 // A late progress report must not bring "Preparing" back once sharing started.
                 guard let self, let preparer, preparer === self.preparer, self.sender == nil else { return }
-                self.preparing = Preparing(fraction: fraction, remuxOnly: plan.isRemuxOnly, speed: speed)
+                self.preparing = Preparing(fraction: fraction, remuxOnly: preparer.activePlan.isRemuxOnly, speed: speed,
+                                           repairingTiming: plan.repairVideoTimestamps)
                 if Date().timeIntervalSince(self.lastPreparingSent) > 0.5 {
                     self.lastPreparingSent = Date()
                     self.control?.send(.preparing(fraction: fraction))
@@ -136,7 +153,7 @@ public final class Party: ObservableObject {
                 switch result {
                 case .success(let url):
                     do {
-                        try self.startSharing(url, name: name)
+                        try self.startSharing(url, name: name, plan: preparer.activePlan)
                     } catch {
                         self.preparationFailed(error.localizedDescription)
                     }
@@ -158,9 +175,11 @@ public final class Party: ObservableObject {
     }
 
     /// Host: the film is ready; tell the guest (if already here) and start sending.
-    private func startSharing(_ file: URL, name: String) throws {
-        let sender = try FileSender(url: file, name: name)
+    private func startSharing(_ file: URL, name: String, plan: ConversionPlan?) throws {
+        let sender = try FileSender(url: file, name: name, videoConverted: plan?.reencodesVideo ?? false,
+                                    audioConverted: plan?.reencodesAudio ?? false)
         self.sender = sender
+        sharedFilm = sender.info
         preparing = nil
         playback.load(asset: AVURLAsset(url: file))
         if let control {
@@ -192,6 +211,7 @@ public final class Party: ObservableObject {
         playback.unload()
         hub.stop()
         receiver = nil
+        sharedFilm = nil
         sender?.detach()
         if let sender, sender.url.path.hasPrefix(FilmPreparer.directory.path) {
             try? FileManager.default.removeItem(at: sender.url)
@@ -352,6 +372,7 @@ public final class Party: ObservableObject {
         do {
             let receiver = try FileReceiver(info: info)
             self.receiver = receiver
+            sharedFilm = info
             filmName = (info.name as NSString).deletingPathExtension
             receiver.requestChunks = { [weak self] chunks, urgent in self?.control?.send(.want(chunks: chunks, urgent: urgent)) }
             receiver.onProgress = { [weak self] fraction in

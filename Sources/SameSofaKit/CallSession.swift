@@ -92,13 +92,11 @@ public final class CallSession: NSObject, RTCPeerConnectionDelegate {
 
     private func addLocalMedia() {
         guard let pc else { return }
-        // Apple voice processing already cancels echo and noise; running
-        // WebRTC's own canceller on top would fight it. In headphones mode
-        // there is no echo to cancel.
-        let processing: [String: String] = audio.mode == .synthetic ? [
+        // SameSofa cleans the microphone itself (AudioHub: echo cancellation
+        // that also knows about the film, noise suppression, gain control);
+        // WebRTC's own processing, which only knows the voice, stays off.
+        let processing: [String: String] = [
             "googEchoCancellation": "false", "googAutoGainControl": "false", "googNoiseSuppression": "false", "googHighpassFilter": "false",
-        ] : [
-            "googEchoCancellation": "false", "googAutoGainControl": "false", "googNoiseSuppression": audio.mode == .headphones ? "true" : "false",
         ]
         let audioSource = factory.audioSource(with: RTCMediaConstraints(mandatoryConstraints: processing, optionalConstraints: nil))
         let audioTrack = factory.audioTrack(with: audioSource, trackId: "mic")

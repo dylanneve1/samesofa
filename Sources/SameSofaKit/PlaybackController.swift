@@ -3,6 +3,10 @@ import Combine
 import Foundation
 import SameSofaCore
 
+/// Test hook: every buffer of film sound exactly as the player goes on to
+/// play it (buffers, frames, channels, position in frames if known).
+public typealias FilmAudioMonitor = (UnsafeMutableAudioBufferListPointer, Int, Int, Int64?) -> Void
+
 /// Drives one AVPlayer so that it follows the shared timeline in a SyncEngine.
 /// Lives on the main thread.
 public final class PlaybackController: ObservableObject {
@@ -20,6 +24,35 @@ public final class PlaybackController: ObservableObject {
     @Published public private(set) var hasSubtitles = false
     @Published public private(set) var subtitlesOn = false
     private var subtitleGroup: AVMediaSelectionGroup?
+    /// What is being played (codecs, sizes, bit rates), for the quality readout.
+    @Published public private(set) var quality = PlaybackQuality()
+    /// Test hook, set before `load`.
+    public var filmAudioMonitor: FilmAudioMonitor?
+    /// How often the playback speed was nudged to stay in sync (diagnostics).
+    public private(set) var nudgeCount = 0
+    private var nudging = false
+    /// The film's frame rate (0 if unknown), for matching the display to it.
+    @Published public private(set) var frameRate = 0.0
+    /// Let the system apply spatial audio (Dolby Atmos, AirPods) instead of
+    /// a plain downmix. Set before `load`.
+    public var systemSpatialAudio = false
+    /// How often an item's sound was set up (must be once per film) and how
+    /// often the playback speed was changed: both make the system rebuild its
+    /// audio pipeline, so tests keep an eye on them.
+    public private(set) var audioSetupCount = 0
+    public private(set) var rateChangeCount = 0
+    /// Host: how often the timeline was moved to the player instead of nudging.
+    public private(set) var reanchorCount = 0
+    private var loadGeneration = 0
+    /// Makes the listening tap for the current film, until it has been attached.
+    private var listening: (() -> AVAudioMix?)?
+    private var hostSlipTicks = 0
+
+    private func setRate(_ rate: Float) {
+        guard player.rate != rate else { return }
+        player.rate = rate
+        rateChangeCount += 1
+    }
 
     public private(set) var engine: SyncEngine
     private let hub: AudioHub
@@ -46,6 +79,9 @@ public final class PlaybackController: ObservableObject {
         self.hub = hub
         player.automaticallyWaitsToMinimizeStalling = false
         player.actionAtItemEnd = .pause
+        // The film's sound goes straight from the player to the normal sound
+        // output; nothing of ours sits in between.
+        player.volume = hub.filmVolume
         if hub.mode == .synthetic { player.isMuted = true }
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer!, forMode: .common)
@@ -66,20 +102,56 @@ public final class PlaybackController: ObservableObject {
 
     public func load(asset: AVURLAsset) {
         isLoaded = false
-        let item = AVPlayerItem(asset: asset)
-        item.audioTimePitchAlgorithm = .timeDomain
-        item.preferredForwardBufferDuration = 20
-        player.replaceCurrentItem(with: item)
-        observers = [item.observe(\.status) { [weak self] item, _ in
-            DispatchQueue.main.async { if item.status == .readyToPlay { self?.isLoaded = true; self?.apply() } }
-        }]
+        loadGeneration += 1
+        let generation = loadGeneration
         Task { [weak self] in
             let duration = (try? await asset.load(.duration))?.seconds ?? 0
             let audioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
             let videoTracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
             let legible = try? await asset.loadMediaSelectionGroup(for: .legible)
+            let quality = await PlaybackQuality.describe(video: videoTracks.first, audio: audioTracks.first)
+            var roles: [ChannelRole]?
+            if let format = (try? await audioTracks.first?.load(.formatDescriptions))?.first {
+                roles = ChannelLayoutReader.roles(for: format)
+            }
+            let channelRoles = roles
+            let frameRate = Double((try? await videoTracks.first?.load(.nominalFrameRate)) ?? 0)
             await MainActor.run {
-                guard let self, self.player.currentItem === item else { return }
+                guard let self, self.loadGeneration == generation else { return }
+                // Everything about the item's sound is decided here, once,
+                // before the player gets the item: changing it later makes the
+                // system rebuild its audio pipeline (audible with Dolby
+                // Atmos and other spatial formats).
+                let item = AVPlayerItem(asset: asset)
+                // Plain resampling: bit-transparent at normal speed, and free of
+                // the artefacts of time stretching during a guest's rare, tiny sync nudges.
+                item.audioTimePitchAlgorithm = .varispeed
+                item.preferredForwardBufferDuration = 20
+                if self.systemSpatialAudio {
+                    // The system decides (Dolby Atmos, spatial audio with AirPods...).
+                    // Nothing listens in, so the film cannot be removed from the microphone.
+                    self.hub.setFilmTimebase(nil)
+                } else {
+                    // A plain stereo or multichannel signal, folded down by the
+                    // system when the output has fewer channels.
+                    item.allowedAudioSpatializationFormats = []
+                    // With speakers, listen in (a copy only: the sound itself is
+                    // not touched) so the film can be removed from the
+                    // microphone during a call. With headphones nothing is
+                    // attached; should the output change to speakers later,
+                    // `soundOutputChanged` attaches it then.
+                    self.listening = audioTracks.first.map { track in
+                        { [hub = self.hub, monitor = self.filmAudioMonitor] in FilmAudioTap.audioMix(for: track, roles: channelRoles, hub: hub, monitor: monitor) }
+                    }
+                    if self.hub.wantsFilmReference, let mix = self.listening?() {
+                        item.audioMix = mix
+                        self.listening = nil
+                        self.hub.setFilmTimebase(item.timebase)
+                    } else {
+                        self.hub.setFilmTimebase(nil)
+                    }
+                }
+                self.audioSetupCount += 1
                 self.subtitleGroup = legible
                 self.hasSubtitles = !(legible?.options.isEmpty ?? true)
                 // Off by default; the toggle in the controls turns them on.
@@ -87,12 +159,25 @@ public final class PlaybackController: ObservableObject {
                 self.subtitlesOn = false
                 self.duration = duration.isFinite ? duration : 0
                 self.hasVideo = !videoTracks.isEmpty
-                if let track = audioTracks.first, let mix = FilmAudioTap.audioMix(for: track, hub: self.hub) {
-                    item.audioMix = mix
-                }
-                self.hub.start()
+                self.quality = quality
+                self.frameRate = frameRate
+                self.observers = [item.observe(\.status) { [weak self] item, _ in
+                    DispatchQueue.main.async { if item.status == .readyToPlay { self?.isLoaded = true; self?.apply() } }
+                }]
+                self.player.replaceCurrentItem(with: item)
             }
         }
+    }
+
+    /// The sound output or the headphones setting changed. If the film now
+    /// has to be removed from the microphone and nothing listens to it yet,
+    /// start listening (once; it is never removed again for this film).
+    public func soundOutputChanged() {
+        guard hub.wantsFilmReference, let item = player.currentItem, item.audioMix == nil, let mix = listening?() else { return }
+        listening = nil
+        item.audioMix = mix
+        audioSetupCount += 1
+        hub.setFilmTimebase(item.timebase)
     }
 
     /// Shows or hides the film's subtitles (each side chooses for itself).
@@ -112,8 +197,13 @@ public final class PlaybackController: ObservableObject {
         hasSubtitles = false
         subtitlesOn = false
         subtitleGroup = nil
+        loadGeneration += 1
+        listening = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
+        hub.setFilmTimebase(nil)
+        frameRate = 0
+        quality = PlaybackQuality()
         observers = []
         isLoaded = false
     }
@@ -192,7 +282,7 @@ public final class PlaybackController: ObservableObject {
         Log.debug("\(engine.role) apply playing=\(engine.timeline.playing) effective=\(engine.effectivePlaying) held=\(engine.isHeld) target=\(String(format: "%.2f", target)) actual=\(String(format: "%.2f", currentTime)) anchorIn=\(String(format: "%.2f", engine.timeline.anchor - now))")
         guard engine.effectivePlaying else {
             pendingStartUntil = 0
-            player.rate = 0
+            setRate(0)
             if abs(currentTime - target) > 0.04 { seekPrecisely(to: target, thenPlay: false) }
             return
         }
@@ -204,7 +294,7 @@ public final class PlaybackController: ObservableObject {
         } else if abs(currentTime - target) > 0.5 {
             startSynced(atLocal: local + 0.5)
         } else {
-            player.rate = 1
+            setRate(1)
         }
     }
 
@@ -216,7 +306,7 @@ public final class PlaybackController: ObservableObject {
         let timeline = engine.timeline
         let startShared = startLocal + clockOffset
         let position = engine.targetPosition(at: startShared)
-        player.rate = 0
+        setRate(0)
         pendingStartUntil = startLocal + 0.4
         let began = localNow()
         seekPrecisely(to: position, thenPlay: false) { [weak self] in
@@ -224,13 +314,14 @@ public final class PlaybackController: ObservableObject {
             let local = self.localNow()
             Log.debug("\(self.engine.role) seek done after \(String(format: "%.2f", local - began)) s, start in \(String(format: "%.2f", startLocal - local)) s")
             if local > startLocal - 0.01 {
-                guard attempt < 4 else { self.player.rate = 1; return }
+                guard attempt < 4 else { self.setRate(1); return }
                 let took = local - began
                 self.startSynced(atLocal: local + min(3, max(0.5, took * 1.5)), attempt: attempt + 1)
                 return
             }
             let hostTime = CMTime(seconds: startLocal - self.testClockSkew, preferredTimescale: 1_000_000_000)
             self.player.setRate(1, time: CMTime(seconds: position, preferredTimescale: 600), atHostTime: hostTime)
+            self.rateChangeCount += 1
         }
     }
 
@@ -243,7 +334,7 @@ public final class PlaybackController: ObservableObject {
                 guard let self else { return }
                 self.seeking = false
                 guard finished else { return }
-                if let completion { completion() } else if thenPlay, self.engine.effectivePlaying { self.player.rate = 1 }
+                if let completion { completion() } else if thenPlay, self.engine.effectivePlaying { self.setRate(1) }
                 self.stallWatch = nil
             }
         }
@@ -269,12 +360,33 @@ public final class PlaybackController: ObservableObject {
         // Drift correction, at most every half second and not mid-seek/start.
         guard !seeking, local > pendingStartUntil, local - lastCorrectionAt >= 0.5 else { return }
         lastCorrectionAt = local
-        switch engine.correction(actualPosition: actual, now: now) {
+        switch engine.correction(actualPosition: actual, now: now, nudging: nudging) {
         case .none(let rate):
-            if Float(rate) != player.rate { player.rate = Float(rate) }
+            nudging = false
+            hostSlipTicks = 0
+            setRate(Float(rate))
         case .adjustRate(let rate):
-            player.rate = Float(rate)
+            if engine.role == .host {
+                // The host is the reference and never changes speed. If its
+                // player has slipped (and stays off for a second), the
+                // timeline moves to the player and the guest follows.
+                hostSlipTicks += 1
+                if hostSlipTicks >= 2 {
+                    hostSlipTicks = 0
+                    reanchorCount += 1
+                    send?(.timeline(engine.reanchor(now: now, actualPosition: actual)))
+                }
+            } else if !nudging || (rate > 1) != (player.rate > 1) {
+                // One speed for the whole correction, chosen at its start and
+                // held until the gap is closed: every change of speed is a
+                // small disturbance in itself.
+                nudgeCount += 1
+                nudging = true
+                setRate(Float(rate))
+            }
         case .seek(let target):
+            nudging = false
+            hostSlipTicks = 0
             guard local - lastSeekAt > 1.5 else { return }
             if engine.effectivePlaying {
                 // Falling behind because the film hasn't arrived yet is buffering,
