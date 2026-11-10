@@ -18,12 +18,6 @@ var argv = CommandLine.arguments.dropFirst()
 while let key = argv.popFirst() {
     if key.hasPrefix("--") { args[String(key.dropFirst(2))] = argv.popFirst() ?? "" }
 }
-guard let server = args["server"].flatMap(URL.init(string:)), let filmPath = args["film"] else {
-    print("usage: samesofa-itest --server ws://127.0.0.1:8787 --film test.mp4 [--soak seconds] [--throttle bytesPerSecond]")
-    exit(2)
-}
-let filmURL = URL(fileURLWithPath: filmPath)
-
 // Optional: start the real voice-processing audio engine at zero volume and
 // report whether it runs on this machine (it needs a microphone).
 if args["audio-check"] != nil {
@@ -36,6 +30,14 @@ if args["audio-check"] != nil {
     hub.stop()
     exit(0)
 }
+
+guard let server = args["server"].flatMap(URL.init(string:)), let filmPath = args["film"] else {
+    print("usage: samesofa-itest --server ws://127.0.0.1:8787 --film test.mp4 [--soak seconds] [--throttle bytesPerSecond]")
+    exit(2)
+}
+let filmURL = URL(fileURLWithPath: filmPath)
+
+
 let soakSeconds = Double(args["soak"] ?? "120") ?? 120
 if let throttle = args["throttle"] { setenv("SAMESOFA_THROTTLE_BPS", throttle, 1) }
 

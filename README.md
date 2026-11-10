@@ -43,7 +43,9 @@ picture.)*
    - On macOS 14 you can instead right-click (or Control-click) SameSofa in
      Applications, choose **Open**, then **Open**.
 
-   You only have to do this once.
+   You only have to do this once. (For the technical one of you: running
+   `xattr -dr com.apple.quarantine /Applications/SameSofa.app` in Terminal
+   does the same thing.)
 3. When SameSofa asks to use the **camera** and **microphone**, click **Allow**,
    so your partner can see and hear you. (If you clicked *Don't Allow* by
    mistake: System Settings → Privacy & Security → Camera / Microphone → turn
@@ -339,7 +341,12 @@ received file being byte-identical (SHA-256), and leaving/rejoining. The
 `--throttle` run caps the host's upload below the film's bitrate and checks that
 both sides pause when the guest runs dry and resume together.
 
-`swift run samesofa-itest … --audio-check` starts the real voice-processing
+`.github/workflows/ci.yml` runs the server tests, the unit tests and an
+Apple-silicon app build on GitHub's macOS runners. It is manual-only for now
+(see the comment in the file); switch it to run on push once the repository is
+public.
+
+`.build/debug/samesofa-itest --audio-check` starts the real voice-processing
 audio engine at zero volume and reports whether it runs on that Mac.
 
 ### Layout
