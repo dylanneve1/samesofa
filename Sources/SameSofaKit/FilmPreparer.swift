@@ -53,14 +53,25 @@ public struct FilmPreparerError: LocalizedError {
 /// helper, writing to a temporary file. Copies streams macOS already decodes
 /// and re-encodes only the rest (see MediaPlanner).
 public final class FilmPreparer {
-    /// Converted films live here until the session ends; anything left from
-    /// an earlier run (crash, force quit) is removed on the next start.
-    public static var directory: URL {
+    static var parentDirectory: URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("SameSofaPrepared", isDirectory: true)
     }
 
+    /// Converted films live here (one folder per running copy of the app)
+    /// until the session ends; anything left by a copy that is no longer
+    /// running (crash, force quit) is removed on the next start.
+    public static var directory: URL {
+        parentDirectory.appendingPathComponent(String(ProcessInfo.processInfo.processIdentifier), isDirectory: true)
+    }
+
     public static func removeLeftovers() {
-        try? FileManager.default.removeItem(at: directory)
+        let fm = FileManager.default
+        try? fm.removeItem(at: directory)
+        for folder in (try? fm.contentsOfDirectory(atPath: parentDirectory.path)) ?? [] {
+            // Another copy of SameSofa that is still running keeps its films.
+            if let pid = Int32(folder), pid > 0, kill(pid, 0) == 0 || errno == EPERM { continue }
+            try? fm.removeItem(at: parentDirectory.appendingPathComponent(folder))
+        }
     }
 
     /// A same-named .srt next to the film, if any.
