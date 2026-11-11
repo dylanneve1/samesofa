@@ -203,3 +203,59 @@ extension ChunkMap {
         chunkSize > 0 ? Int((fileSize + Int64(chunkSize) - 1) / Int64(chunkSize)) : 0
     }
 }
+
+extension ChunkMap {
+    /// The map as bytes (one bit per chunk, 64-bit little-endian words), for
+    /// keeping a partly received film across a restart of the app.
+    public var bitmap: Data {
+        var data = Data(capacity: bits.count * 8)
+        for word in bits {
+            var le = word.littleEndian
+            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        }
+        return data
+    }
+
+    /// A map restored from `bitmap`. nil when the bytes do not belong to a
+    /// film of this size (wrong length, or chunks marked beyond the end).
+    public init?(fileSize: Int64, chunkSize: Int, bitmap: Data) {
+        guard fileSize >= 0, chunkSize > 0 else { return nil }
+        self.init(fileSize: fileSize, chunkSize: chunkSize)
+        guard bitmap.count == bits.count * 8 else { return nil }
+        var count = 0
+        let bytes = [UInt8](bitmap)
+        for w in 0..<bits.count {
+            var word: UInt64 = 0
+            for b in 0..<8 { word |= UInt64(bytes[w * 8 + b]) << UInt64(8 * b) }
+            if w == bits.count - 1, chunkCount % 64 != 0 {
+                let valid: UInt64 = (1 << UInt64(chunkCount % 64)) - 1
+                guard word & ~valid == 0 else { return nil }
+            }
+            bits[w] = word
+            count += word.nonzeroBitCount
+        }
+        receivedCount = count
+    }
+
+    /// Forgets a chunk (it has to be fetched again).
+    public mutating func unmark(_ index: Int) {
+        guard has(index) else { return }
+        bits[index >> 6] &= ~(1 << UInt64(index & 63))
+        receivedCount -= 1
+    }
+
+    /// Bytes of the film that have arrived.
+    public var receivedBytes: Int64 {
+        guard chunkCount > 0 else { return 0 }
+        var bytes = Int64(receivedCount) * Int64(chunkSize)
+        if has(chunkCount - 1) { bytes -= Int64(chunkSize) - Int64(length(ofChunk: chunkCount - 1)) }
+        return bytes
+    }
+}
+
+extension ChunkScheduler {
+    /// Chunks that turned out to be damaged: fetch them again.
+    public mutating func forget(_ indices: [Int]) {
+        for index in indices { map.unmark(index) }
+    }
+}

@@ -211,6 +211,40 @@ public final class PlaybackController: ObservableObject {
         isLoaded = false
     }
 
+    // MARK: Another film in the same room
+
+    private func forgetFilm() {
+        unload()
+        hasEnoughAhead = nil
+        nudge.reset()
+        hostSlipTicks = 0
+        pendingStartUntil = 0
+        stallWatch = nil
+        correctionSeeks = []
+        remoteActual = nil
+        position = 0
+        duration = 0
+        hasVideo = true
+    }
+
+    /// Host: the film is over (another one follows, or none). The player is
+    /// emptied and a fresh timeline starts, paused at the beginning, with
+    /// sequence numbers above everything sent for the film before.
+    @discardableResult
+    func startOver(partnerLoading: Bool = false) -> Timeline {
+        forgetFilm()
+        let timeline = engine.startOver(now: sharedNow, partnerLoading: partnerLoading)
+        publishState()
+        return timeline
+    }
+
+    /// Guest: the host said the film is over; the next timeline starts at `seq`.
+    func startOver(at seq: Int) {
+        forgetFilm()
+        engine.startOver(at: seq)
+        publishState()
+    }
+
     // MARK: User actions (from either side's UI)
 
     public func togglePlay() { intendsToPlay ? pause() : play() }
@@ -240,8 +274,30 @@ public final class PlaybackController: ObservableObject {
 
     // MARK: From the other side
 
+    /// Test hook: every timeline that arrives from the other side, and whether it was adopted.
+    public var onRemoteTimeline: ((Timeline, Bool) -> Void)?
+
+    /// How often a command given here lost a tie and was given again (diagnostics, tests).
+    public private(set) var reissuedCommands = 0
+    /// Test hook: behave like 1.2.1, where such a command was silently dropped.
+    public var reissuesLostCommands = true
+
     func receive(_ timeline: Timeline) {
-        if engine.receive(timeline) {
+        let adopted = engine.receive(timeline)
+        onRemoteTimeline?(timeline, adopted)
+        if adopted {
+            if let command = engine.takeOverriddenCommand(), reissuesLostCommands {
+                // The other side changed the timeline at the same moment
+                // without having seen what was pressed here: press it again on top.
+                reissuedCommands += 1
+                Log.debug("\(engine.role) command \(command) lost a tie; giving it again")
+                switch command {
+                case .play: play()
+                case .pause: pause()
+                case .seek(let position): seek(to: position)
+                }
+                return
+            }
             apply()
             holdIfUnbuffered(at: engine.targetPosition(at: sharedNow))
         }

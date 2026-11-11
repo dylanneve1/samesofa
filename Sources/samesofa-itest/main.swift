@@ -168,6 +168,54 @@ func runControlLatency() {
     finish()
 }
 
+/// Many commands from both sides while the film saturates the link. A command counts as
+/// lost when the timeline it made is never adopted by the other side.
+func runControlStress(count: Int) {
+    var adopted: [PeerRole: [Int: Date]] = [.host: [:], .guest: [:]]
+    host.playback.onRemoteTimeline = { t, ok in if ok, t.origin == .guest { adopted[.host]![t.seq] = Date() } }
+    guest.playback.onRemoteTimeline = { t, ok in if ok, t.origin == .host { adopted[.guest]![t.seq] = Date() } }
+    var latencies: [Double] = [], lost = 0, lostTies = 0, lostOther = 0, reissued = 0
+    var rng = SystemRandomNumberGenerator()
+    let dur = max(10, host.playback.duration)
+    for i in 0..<count {
+        let from = i % 2 == 0 ? host : guest, to = i % 2 == 0 ? guest : host
+        let t0 = Date()
+        switch (i / 2) % 3 {
+        case 0: from.playback.pause()
+        case 1: from.playback.play()
+        default: from.playback.seek(to: dur * Double(i % 7 + 1) / 9)
+        }
+        let issued = from.playback.engine.timeline
+        let arrived = wait(2) { adopted[to.role]![issued.seq] != nil }
+        if arrived {
+            latencies.append(adopted[to.role]![issued.seq]!.timeIntervalSince(t0) * 1000)
+        } else {
+            // A copy that re-issues a command that lost a tie gets it through with the next number.
+            let again = from.playback.engine.timeline
+            if again.origin == from.role, again.seq > issued.seq, wait(2, { adopted[to.role]![again.seq] != nil }) {
+                reissued += 1
+                latencies.append(adopted[to.role]![again.seq]!.timeIntervalSince(t0) * 1000)
+            } else {
+                lost += 1
+                let theirs = to.playback.engine.timeline
+                let tie = theirs.seq >= issued.seq && theirs.origin != from.role
+                if tie { lostTies += 1 } else { lostOther += 1 }
+                log("LOST command \(i) from \(from.role): issued seq \(issued.seq) playing=\(issued.playing); other side has seq \(theirs.seq) origin \(theirs.origin) -> \(tie ? "lost a tie" : "other")")
+            }
+        }
+        spin(0.05 + Double.random(in: 0...0.3, using: &rng))
+    }
+    latencies.sort()
+    let p50 = latencies.isEmpty ? 0 : latencies[latencies.count / 2], p95 = latencies.isEmpty ? 0 : latencies[max(0, Int(Double(latencies.count) * 0.95) - 1)]
+    log(String(format: "control stress: %d commands, %d lost (%d to a tie, %d other), %d got through on a second try; p50 %.0f ms, p95 %.0f ms, max %.0f ms; transfer at %.0f%%",
+               count, lost, lostTies, lostOther, reissued, p50, p95, latencies.last ?? 0, guest.transferFraction * 100))
+    check("no command is lost in \(count)", lost == 0, "\(lost) lost")
+    check("control latency p95 < 250 ms", p95 < 250, String(format: "p50 %.0f p95 %.0f max %.0f", p50, p95, latencies.last ?? 0))
+    guest.leave()
+    host.leave()
+    finish()
+}
+
 /// Seeks into film the guest does not have yet (throttled link): time until both play again.
 func runSeekScenario() {
     let dur = host.playback.duration
@@ -308,6 +356,9 @@ let guest = Party(role: .guest, settings: settings("Guest", hue: 0.05))
 let skew = Double(args["skew"] ?? "1234.567") ?? 0
 guest.playback.testClockSkew = skew
 let throttled = args["throttle"] != nil
+// Measuring what 1.2.1 did: commands that lose a tie are dropped; the clock comes from the one shortest round trip.
+if args["no-reissue"] != nil { host.playback.reissuesLostCommands = false; guest.playback.reissuesLostCommands = false }
+if args["legacy-clock"] != nil { guest.legacyClockEstimate = true }
 
 // 1. Room by code
 do {
@@ -353,7 +404,18 @@ let duration = host.playback.duration
 check("clock sync found the skew", wait(5) { abs(guest.playback.clockOffset + skew) < 0.005 },
       String(format: "offset %.4f s (true %.4f), best rtt %.1f ms", guest.playback.clockOffset, -skew, guest.clockRoundTrip * 1000))
 
+if args["clock-only"] != nil {
+    // One line for the stress loop: how far off the guest's idea of the host's clock is while the film saturates the link.
+    for after in [0.0, 1.0, 3.0] {
+        spin(after == 0 ? 0 : (after == 1 ? 1 : 2))
+        print(String(format: "CLOCK after %.0f s: error %.2f ms, best rtt %.2f ms, transfer %.0f%%", after,
+                     (guest.playback.clockOffset + skew) * 1000, guest.clockRoundTrip * 1000, guest.transferFraction * 100))
+    }
+    guest.leave(); host.leave()
+    finish()
+}
 if args["control-latency"] != nil { runControlLatency() }
+if let n = args["control-stress"] { runControlStress(count: Int(n) ?? 500) }
 if args["seek-test"] != nil { runSeekScenario() }
 if args["reconnect-test"] != nil { runReconnectScenario() }
 if throttled { runBufferingScenario() }

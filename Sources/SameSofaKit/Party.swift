@@ -36,8 +36,11 @@ public struct PartySettings {
     }
 }
 
-/// One movie night: the room, the call, the film transfer and the shared
-/// playback. Everything the UI shows comes from here. Main thread only.
+/// One evening together: the room, the call, and whatever film is being
+/// watched at the moment, if any. The room and the call do not depend on the
+/// film: the host can open a room without one, change it, or close it, and
+/// the two stay connected. Everything the UI shows comes from here. Main
+/// thread only.
 public final class Party: ObservableObject {
     public enum Phase: Equatable {
         case idle
@@ -79,6 +82,10 @@ public final class Party: ObservableObject {
     @Published public private(set) var reconnecting = false
     /// How often the call was set up again (diagnostics, tests).
     public private(set) var reconnects = 0
+    /// How many peer connections this party has made (1 for an evening without a drop).
+    public private(set) var callsStarted = 0
+    /// "ice connected", "peer connected", ... of every call, in order (diagnostics, tests).
+    public private(set) var connectionLog: [String] = []
     private var lastRestart = Date.distantPast
     private var dropGrace: DispatchWorkItem?
     private var rateMark: (time: Date, bytes: Double)?
@@ -103,12 +110,18 @@ public final class Party: ObservableObject {
     /// Host: the film is being converted to MP4 before it can be shared.
     /// Guest: the host said so. nil when nothing is being prepared.
     @Published public private(set) var preparing: Preparing?
+    /// Host: the file that was picked is being looked at. Guest: the host
+    /// has picked another film and it has not arrived yet.
+    @Published public private(set) var choosingFilm = false
+    /// Why the film that was picked cannot be watched (host: not a film,
+    /// conversion failed; guest: no room on this Mac). The room goes on.
+    @Published public var filmNotice: String?
     @Published public private(set) var partnerCameraOn = true
     @Published public private(set) var partnerMicOn = true
     @Published public var micOn = true { didSet { call?.setMicMuted(!micOn); sendMediaState() } }
     @Published public var cameraOn = true { didSet { cameraOn ? call?.startCamera() : call?.stopCamera(); sendMediaState() } }
     @Published public var filmVolume: Float = 1 { didSet { hub.filmVolume = filmVolume; playback.player.volume = filmVolume } }
-    /// The film as shared: on the host its own description, on the guest the host's.
+    /// The film as shared: on the host its own description, on the guest the host's. nil: no film right now.
     @Published public private(set) var sharedFilm: FileInfo?
     @Published public var voiceVolume: Float = 1 { didSet { hub.voiceVolume = voiceVolume } }
 
@@ -117,11 +130,14 @@ public final class Party: ObservableObject {
     public let hub: AudioHub
     public private(set) var code: String?
     let settings: PartySettings
+    /// Where films are kept for resuming (tests give each party its own).
+    public var filmCache: FilmCache = .shared
 
     private let signaling = SignalingClient()
     private(set) var call: CallSession?
     private var control: ControlChannel?
-    private var fileChannel: RTCDataChannel?
+    /// The film channels of the current call, by label.
+    private var fileChannels: [String: RTCDataChannel] = [:]
     private(set) var sender: FileSender?
     private var preparer: FilmPreparer?
     private var lastPreparingSent = Date.distantPast
@@ -134,6 +150,28 @@ public final class Party: ObservableObject {
     private var pingTimer: Timer?
     private var pendingCode: String?
     private var cancellables: Set<AnyCancellable> = []
+
+    // Which film the room is on.
+    /// Host: the numbering of films in this room and what the guest has confirmed.
+    public private(set) var turn = FilmTurn()
+    /// Host: the sequence number the current film's timeline started at.
+    private var filmSeq = 0
+    /// Host: the label of the channel the current film is sent on in this call (nil: none assigned).
+    private var filmChannelLabel: String?
+    /// Host: the call's first film channel ("file") has been given to a film.
+    private var firstChannelUsed = false
+    /// Host: SHA-256 of the whole current film, once worked out.
+    private var filmHash: String?
+    /// Host: a cached converted film in use (released when the film is over).
+    private var preparedID: String?
+    /// Guest: the number of the film it is on (nil: the host has not said yet).
+    public private(set) var guestFilm: Int?
+    /// Guest: the label of the channel the current film arrives on.
+    private var wantedChannel = FileInfo.firstChannel
+    /// The partner's protocol version, from its hello (nil: nobody here, or not said yet).
+    public private(set) var partnerVersion: Int?
+    /// Host: this partner has been told about a film on this visit.
+    private var filmAnnounced = false
 
     public init(role: PeerRole, settings: PartySettings) {
         self.role = role
@@ -154,6 +192,15 @@ public final class Party: ObservableObject {
 
     // MARK: Starting
 
+    /// Host: open a room. No film is needed: the two can see and hear each
+    /// other, and a film can be chosen (and changed) at any time.
+    public func openRoom() {
+        precondition(role == .host)
+        guard phase == .idle else { return }
+        phase = .creatingRoom
+        signaling.connect(to: settings.serverURL)
+    }
+
     /// Host: share `film` as it is and open a room.
     public func host(film: URL) throws {
         try host(film: film, check: .shareAsIs)
@@ -164,17 +211,138 @@ public final class Party: ObservableObject {
     /// told about the film once the conversion has finished.
     public func host(film: URL, check: FilmCheck) throws {
         precondition(role == .host)
-        filmName = film.deletingPathExtension().lastPathComponent
+        try setFilm(film, check: check)
+        openRoom()
+    }
+
+    // MARK: The film (host)
+
+    /// Something to do with a film is going on (one is loaded, being looked at or being prepared).
+    public var hasFilmActivity: Bool { sharedFilm != nil || choosingFilm || preparing != nil }
+
+    /// The partner here is too old to follow a change of film (1.2.1 and earlier).
+    public var partnerIsOld: Bool { partnerVersion.map { $0 < ControlMessage.filmChangeVersion } ?? false }
+
+    /// Host: can the film be changed or closed right now? Not while an
+    /// older partner already has a film: their copy can only ever take one.
+    public var canChangeFilm: Bool { role == .host && !(partnerIsOld && filmAnnounced) }
+
+    /// Host: another film was picked (or the first one). The current film,
+    /// if any, ends on both sides at once; the call and the room go on. The
+    /// file is looked at, converted if need be, then shared.
+    public func changeFilm(to film: URL, inspect: @escaping (URL) async throws -> FilmCheck = { try await FilmPreparer.inspect($0) }) {
+        guard role == .host, canChangeFilm else { return }
+        let number = beginFilmChange(name: film.deletingPathExtension().lastPathComponent)
+        Task { @MainActor in
+            do {
+                let check = try await inspect(film)
+                // Changed again (or closed) while this file was being looked at.
+                guard self.turn.current == number, self.choosingFilm else { return }
+                try self.share(film, check: check)
+            } catch {
+                guard self.turn.current == number else { return }
+                let reason = error is FilmPreparerError ? error.localizedDescription
+                    : "Couldn't open that file (\(error.localizedDescription)). Check that it is still where it was, or pick another film."
+                self.filmFailed(reason)
+            }
+        }
+    }
+
+    /// Host: share a film that has already been looked at (`FilmPreparer.inspect`).
+    public func setFilm(_ film: URL, check: FilmCheck) throws {
+        guard role == .host, canChangeFilm else { return }
+        beginFilmChange(name: film.deletingPathExtension().lastPathComponent)
+        do {
+            try share(film, check: check)
+        } catch {
+            filmFailed(nil)
+            throw error
+        }
+    }
+
+    /// Host: stop watching this film. Both go back to just being in the room together.
+    public func closeFilm() {
+        guard role == .host, canChangeFilm, hasFilmActivity else { return }
+        endFilm()
+        sendFilmState()
+    }
+
+    /// Ends the current film on this side and starts the next number.
+    @discardableResult
+    private func beginFilmChange(name: String) -> Int {
+        endFilm()
+        choosingFilm = true
+        filmName = name
+        sendFilmState()
+        return turn.current
+    }
+
+    private func filmFailed(_ reason: String?) {
+        preparer = nil
+        preparing = nil
+        choosingFilm = false
+        filmName = nil
+        filmNotice = reason
+        sendFilmState()
+    }
+
+    /// Host: everything of the current film goes; the room, the call and the code stay.
+    private func endFilm() {
+        if let preparer {
+            preparer.cancel()
+            self.preparer = nil
+        }
+        if let sender {
+            sender.stop()
+            if sender.url.path.hasPrefix(FilmPreparer.parentDirectory.path) { try? FileManager.default.removeItem(at: sender.url) }
+        }
+        sender = nil
+        if let preparedID { filmCache.release(preparedID) }
+        preparedID = nil
+        filmHash = nil
+        closeFilmChannel()
+        clearFilmState()
+        turn.advance()
+        filmSeq = playback.startOver().seq
+        refreshVersionNote()
+    }
+
+    /// What both roles forget when a film is over.
+    private func clearFilmState() {
+        sharedFilm = nil
+        filmName = nil
+        preparing = nil
+        choosingFilm = false
+        filmNotice = nil
+        transferFraction = 0
+        transferLine = ""; rateMark = nil; smoothedRate = 0
+        receivedRanges = []
+    }
+
+    /// Host: the film has been looked at; convert it if need be, then share it.
+    private func share(_ film: URL, check: FilmCheck) throws {
         switch check {
         case .shareAsIs:
-            try startSharing(film, name: film.lastPathComponent, plan: nil)
+            try startSharing(film, name: film.lastPathComponent, videoConverted: false, audioConverted: false)
         case .convert(let plan, let tools):
             guard FileManager.default.isReadableFile(atPath: film.path) else {
                 throw FilmPreparerError("Couldn't read that file.")
             }
+            let name = film.deletingPathExtension().appendingPathExtension("mp4").lastPathComponent
+            // A hardware encoder does not produce the same bytes twice, so the
+            // converted film is kept and found again by what went in and how.
+            let key = Self.conversionKey(film: film, plan: plan, tools: tools)
+            if let key, let kept = filmCache.prepared(key: key) {
+                Log.debug("host: converted film found in the cache")
+                preparedID = kept.id
+                try startSharing(kept.file, name: name, videoConverted: kept.videoConverted, audioConverted: kept.audioConverted)
+                return
+            }
             let preparer = FilmPreparer(input: film, plan: plan, tools: tools)
             self.preparer = preparer
+            choosingFilm = false
             preparing = Preparing(fraction: 0, remuxOnly: plan.isRemuxOnly, speed: nil, repairingTiming: plan.repairVideoTimestamps)
+            control?.send(.preparing(fraction: 0))
             preparer.onProgress = { [weak self, weak preparer] fraction, speed in
                 // A late progress report must not bring "Preparing" back once sharing started.
                 guard let self, let preparer, preparer === self.preparer, self.sender == nil else { return }
@@ -185,58 +353,137 @@ public final class Party: ObservableObject {
                     self.control?.send(.preparing(fraction: fraction))
                 }
             }
-            let name = film.deletingPathExtension().appendingPathExtension("mp4").lastPathComponent
             preparer.start { [weak self, weak preparer] result in
                 guard let self, let preparer, preparer === self.preparer else { return }
+                self.preparer = nil
                 switch result {
                 case .success(let url):
                     do {
-                        try self.startSharing(url, name: name, plan: preparer.activePlan)
+                        let active = preparer.activePlan
+                        var file = url
+                        if let key, let kept = self.filmCache.adoptPrepared(key: key, file: url, videoConverted: active.reencodesVideo,
+                                                                            audioConverted: active.reencodesAudio) {
+                            self.preparedID = kept.id
+                            file = kept.file
+                        }
+                        try self.startSharing(file, name: name, videoConverted: active.reencodesVideo, audioConverted: active.reencodesAudio)
                     } catch {
-                        self.preparationFailed(error.localizedDescription)
+                        self.filmFailed(error.localizedDescription)
                     }
                 case .failure(let error):
                     if error is CancellationError { return }
-                    self.preparationFailed(error.localizedDescription)
+                    self.filmFailed(error.localizedDescription)
                 }
             }
         }
-        phase = .creatingRoom
-        signaling.connect(to: settings.serverURL)
     }
 
-    private func preparationFailed(_ message: String) {
-        preparer = nil
-        preparing = nil
-        leave()
-        phase = .ended(message)
+    private static func conversionKey(film: URL, plan: ConversionPlan, tools: FFmpegTools) -> String? {
+        guard let source = try? FilmFingerprint.compute(file: film) else { return nil }
+        var sidecarPrint: String?
+        var arguments = plan.ffmpegArguments(input: "IN", output: "OUT")
+        if case .sidecar(let path) = plan.subtitles {
+            sidecarPrint = try? FilmFingerprint.compute(file: URL(fileURLWithPath: path))
+            arguments = arguments.map { $0 == path ? "SIDECAR" : $0 }
+        }
+        let tool = ((try? FileManager.default.attributesOfItem(atPath: tools.ffmpeg.path))?[.size] as? NSNumber)?.stringValue ?? "ffmpeg"
+        return FilmFingerprint.conversionKey(source: source, sidecar: sidecarPrint, arguments: arguments, tool: tool)
     }
 
     /// Host: the film is ready; tell the guest (if already here) and start sending.
-    private func startSharing(_ file: URL, name: String, plan: ConversionPlan?) throws {
-        let sender = try FileSender(url: file, name: name, videoConverted: plan?.reencodesVideo ?? false,
-                                    audioConverted: plan?.reencodesAudio ?? false)
+    private func startSharing(_ file: URL, name: String, videoConverted: Bool, audioConverted: Bool) throws {
+        let sender = try FileSender(url: file, name: name, videoConverted: videoConverted, audioConverted: audioConverted)
         self.sender = sender
-        sharedFilm = sender.info
+        choosingFilm = false
         preparing = nil
+        filmNotice = nil
+        // A partner who is here has to fetch the film first: until they say
+        // they are ready, the film waits for them.
+        if partnerPresent { playback.remoteBuffering(true, at: 0) }
         playback.load(asset: AVURLAsset(url: file))
-        if let control {
-            control.send(.fileInfo(sender.info))
-            control.send(.timeline(playback.engine.timeline))
+        assignFilmChannel()
+        sharedFilm = announcedInfo()
+        sendFilmState()
+        refreshVersionNote()
+        let number = turn.current
+        sender.computeFullHash { [weak self, weak sender] hash in
+            guard let self, let sender, sender === self.sender, self.turn.current == number else { return }
+            self.filmHash = hash
+            self.control?.send(.filmHash(film: number, sha256: hash))
         }
-        if let fileChannel { sender.attach(fileChannel) }
+    }
+
+    /// A partner is in the room (connected, or being reconnected).
+    private var partnerPresent: Bool { phase == .together || phase == .connecting }
+
+    /// Host: the film as the guest is told about it.
+    private func announcedInfo() -> FileInfo? {
+        guard var info = sender?.info else { return nil }
+        info.film = turn.current
+        info.channel = filmChannelLabel ?? FileInfo.firstChannel
+        info.seq = filmSeq
+        return info
+    }
+
+    /// Host: tells the partner where the room stands: this film, a film on its way, or none.
+    private func sendFilmState() {
+        guard role == .host, let control else { return }
+        if let info = announcedInfo() {
+            control.send(.fileInfo(info))
+            control.send(.timeline(playback.engine.timeline))
+            if let filmHash { control.send(.filmHash(film: turn.current, sha256: filmHash)) }
+            filmAnnounced = true
+            refreshVersionNote()
+        } else if choosingFilm || preparing != nil {
+            control.send(.filmChanging(film: turn.current, seq: filmSeq))
+            if let preparing { control.send(.preparing(fraction: preparing.fraction)) }
+        } else {
+            control.send(.noFilm(film: turn.current, seq: filmSeq))
+        }
+    }
+
+    /// Host: gives the current film a channel of its own on the current call.
+    /// The first film of a call takes the channel every version knows
+    /// ("file"); each later one gets a new channel.
+    private func assignFilmChannel() {
+        guard role == .host, let call, let sender, filmChannelLabel == nil else { return }
+        if !firstChannelUsed, let channel = fileChannels[FileInfo.firstChannel] {
+            firstChannelUsed = true
+            filmChannelLabel = FileInfo.firstChannel
+            sender.attach(channel)
+        } else if firstChannelUsed {
+            let label = FileInfo.laterChannelPrefix + String(turn.current)
+            guard let channel = call.openFilmChannel(label: label) else { return }
+            fileChannels[label] = channel
+            filmChannelLabel = label
+            sender.attach(channel)
+        }
+    }
+
+    /// Host: the film's channel is closed with the film. What was still
+    /// queued on it is dropped, and whatever is already on its way arrives on
+    /// a channel nobody listens to any more.
+    private func closeFilmChannel() {
+        guard let label = filmChannelLabel else { return }
+        filmChannelLabel = nil
+        if let channel = fileChannels.removeValue(forKey: label) {
+            ChannelRelay.attach(channel, to: nil)
+            channel.close()
+        }
     }
 
     /// Guest: join the room with this code.
     public func join(code rawCode: String) {
         precondition(role == .guest)
-        guard let code = RoomCode.normalize(rawCode) else { phase = .ended("That code doesn't look right."); return }
+        guard let code = RoomCode.normalize(rawCode) else { phase = .ended("That code doesn't look right. It has six letters and digits."); return }
         pendingCode = code
+        // A host before 1.3 always has a film and expects the guest to say it is loading.
         playback.startBuffering()
         phase = .joining
         signaling.connect(to: settings.serverURL)
     }
 
+    /// Leaves the room: the call ends (the host leaving closes the room).
     public func leave() {
         if let preparer {
             preparer.cancel()
@@ -248,15 +495,17 @@ public final class Party: ObservableObject {
         signaling.disconnect()
         playback.unload()
         hub.stop()
+        receiver?.cancel()
         receiver = nil
-        sharedFilm = nil
-        transferLine = ""; rateMark = nil; smoothedRate = 0
-        sender?.detach()
-        if let sender, sender.url.path.hasPrefix(FilmPreparer.directory.path) {
-            try? FileManager.default.removeItem(at: sender.url)
+        playback.hasEnoughAhead = nil
+        if let sender {
+            sender.stop()
+            if sender.url.path.hasPrefix(FilmPreparer.parentDirectory.path) { try? FileManager.default.removeItem(at: sender.url) }
         }
         sender = nil
-        preparing = nil
+        if let preparedID { filmCache.release(preparedID) }
+        preparedID = nil
+        clearFilmState()
         phase = .ended("")
     }
 
@@ -283,6 +532,7 @@ public final class Party: ObservableObject {
             // "restart": the host is about to offer a fresh call. "retry": the guest asks for one.
             // Older versions ignore both (they carry no description and no candidate).
             if payload["sdp"] == nil, payload["candidate"] == nil, let kind = payload["kind"] as? String {
+                if holdReconnectForTesting { return }
                 if kind == "restart", role == .guest { restartCall() }
                 if kind == "retry", role == .host { hostRestart(force: false) }
                 return
@@ -292,24 +542,39 @@ public final class Party: ObservableObject {
             partnerLeft()
         case .roomClosed:
             teardownCall()
-            phase = .ended("The room was closed.")
+            phase = .ended("Your partner closed the room.")
         case .error(let error):
+            let message = Self.roomErrorText(error)
             switch error {
-            case "no-such-room", "bad-code": phase = .ended("No movie night with that code. Check it and try again.")
-            case "room-full": phase = .ended("That room already has two people in it.")
-            default: if phase != .together { phase = .ended("Something went wrong (\(error)).") }
+            case "no-such-room", "bad-code", "room-full": phase = .ended(message)
+            default: if phase != .together { phase = .ended(message) }
             }
         case .disconnected:
             // Once the call is up the room server is no longer needed.
             switch phase {
             case .together, .ended: break
-            default: phase = .ended("Couldn't reach the SameSofa server. Check the internet connection and try again.")
+            default: phase = .ended("Couldn't reach the SameSofa server. Check your internet connection and try again.")
             }
+        }
+    }
+
+    /// What to tell a person when the room server says no. Never the server's own wording.
+    static func roomErrorText(_ error: String) -> String {
+        switch error {
+        case "no-such-room", "bad-code":
+            return "There is no room with that code. Check it with your partner and try again."
+        case "room-full":
+            return "Two people are already in that room. If you were in it a moment ago, wait a few seconds and try again; otherwise ask your partner to start a new room."
+        case "server-full":
+            return "The SameSofa server is busy right now. Try again in a few minutes."
+        default:
+            return "Something went wrong with the room. Try again; if it keeps happening, start a new room."
         }
     }
 
     private func startCall() {
         teardownCall()
+        callsStarted += 1
         let call = CallSession(role: role, audio: hub, ice: settings.ice, camera: cameraOn ? settings.camera : .none)
         call.delegate = self
         self.call = call
@@ -367,7 +632,7 @@ public final class Party: ObservableObject {
         // A short interruption often heals by itself; otherwise set the call up again.
         dropGrace?.cancel()
         let item = DispatchWorkItem { [weak self] in
-            guard let self, self.reconnecting else { return }
+            guard let self, self.reconnecting, !self.holdReconnectForTesting else { return }
             if self.role == .host { self.hostRestart(force: false) } else { self.signaling.signal(["kind": "retry"]) }
         }
         dropGrace = item
@@ -406,6 +671,15 @@ public final class Party: ObservableObject {
         connectionDropped()
     }
 
+    /// Test hook: a control message arrives as if the partner had sent it (late ones included).
+    public func injectForTesting(_ message: ControlMessage) { handle(message) }
+
+    /// Test hook: estimate the clock offset as 1.2.1 did (for measuring the difference).
+    public var legacyClockEstimate = false
+
+    /// Test hook: no restart after a drop, so the "Connection lost" card stays up (screenshots).
+    public var holdReconnectForTesting = ProcessInfo.processInfo.environment["SAMESOFA_TEST_HOLD_RECONNECT"] == "1"
+
     private func armConnectTimeout() {
         connectionFailed = false
         connectTimeout?.cancel()
@@ -430,7 +704,9 @@ public final class Party: ObservableObject {
         control?.close()
         control = nil
         sender?.detach()
-        fileChannel = nil
+        fileChannels.removeAll()
+        filmChannelLabel = nil
+        firstChannelUsed = false
         call?.close()
         call = nil
         remoteVideoTrack = nil
@@ -439,6 +715,9 @@ public final class Party: ObservableObject {
 
     private func partnerLeft() {
         versionNote = nil
+        partnerVersion = nil
+        filmAnnounced = false
+        turn.connectionReset()
         if role == .host { receivedRanges = [] }
         dropGrace?.cancel()
         partnerPositionTimeout?.cancel()
@@ -448,6 +727,7 @@ public final class Party: ObservableObject {
         teardownCall()
         playback.resetRemote()
         if role == .host, let code {
+            if sharedFilm != nil { transferFraction = 0; transferLine = "" }
             phase = .waitingForPartner(code: code)
         } else {
             phase = .ended("Your partner left.")
@@ -458,53 +738,104 @@ public final class Party: ObservableObject {
 
     private func controlOpened(_ channel: RTCDataChannel) {
         Log.debug("\(role) control channel handed, state \(channel.readyState.rawValue)")
-        let control = ControlChannel(channel: channel) { [weak self] message in self?.handle(message) }
+        let playback = self.playback
+        let control = ControlChannel(channel: channel, now: { playback.localNow() }) { [weak self] message, at in self?.handle(message, receivedAt: at) }
         self.control = control
         control.send(.hello(role: role, protocolVersion: ControlMessage.protocolVersion))
         sendMediaState()
         if role == .host {
-            if let sender {
-                control.send(.fileInfo(sender.info))
-                control.send(.timeline(playback.engine.timeline))
-            } else if let preparing {
-                control.send(.preparing(fraction: preparing.fraction))
-            }
+            // Nothing the guest says about a film counts until it has said which film it is on.
+            turn.connectionReset()
+            if sender != nil { playback.remoteBuffering(true, at: playback.currentTime) }
+            sendFilmState()
         } else {
+            if let guestFilm { control.send(.filmAck(film: guestFilm)) }
             control.send(.buffering(playback.engine.localBuffering, position: playback.currentTime))
-            startClockSync()
+            // From the moment the channel is open: the first exchanges happen before the film starts to fill the link.
+            control.onOpen = { [weak self, weak control] in
+                guard let self, let control, control === self.control else { return }
+                self.startClockSync()
+            }
         }
     }
 
-    private func handle(_ message: ControlMessage) {
+    /// Host: is what the guest says about "the film" about the current one?
+    private var guestIsOnCurrentFilm: Bool { role == .guest || turn.guestIsOnCurrentFilm }
+
+    private func refreshVersionNote() {
+        guard let partnerVersion else { versionNote = nil; return }
+        switch ControlMessage.compatibility(with: partnerVersion) {
+        case .same, .incompatible: versionNote = nil
+        case .note(let text):
+            // The host of an older guest is told what to do about it right now.
+            versionNote = role == .host ? (ControlMessage.oldPartnerNote(theirs: partnerVersion, hasFilm: sender != nil) ?? text) : text
+        }
+    }
+
+    /// `receivedAt`: this side's clock when the message arrived (before it waited for the main thread).
+    private func handle(_ message: ControlMessage, receivedAt: Double? = nil) {
         if case .want = message {} else if case .ping = message {} else if case .pong = message {} else if case .heartbeat = message {} else {
             Log.debug("\(role) got \(message)")
         }
         switch message {
         case .hello(_, let version):
             Log.debug("\(role) partner speaks protocol \(version), this copy \(ControlMessage.protocolVersion)")
-            switch ControlMessage.compatibility(with: version) {
-            case .same: versionNote = nil
-            case .note(let text): versionNote = text
-            case .incompatible(let text):
+            if case .incompatible(let text) = ControlMessage.compatibility(with: version) {
                 leave()
                 phase = .ended(text)
+                return
             }
+            partnerVersion = version
+            turn.partnerVersion = version
+            refreshVersionNote()
         case .fileInfo(let info):
-            guard role == .guest, receiver == nil else { return }
-            preparing = nil
+            guard role == .guest else { return }
+            if receiver != nil, info.film == nil || info.film == guestFilm {
+                // The film this copy is already on, announced again (a new connection): it may be on another channel now.
+                if info.film != nil {
+                    wantedChannel = info.channel ?? FileInfo.firstChannel
+                    attachReceiver()
+                }
+                return
+            }
+            if let film = info.film {
+                if film != guestFilm || receiver != nil { guestFilmChanged(to: film, seq: info.seq ?? playback.engine.timeline.seq + SyncEngine.filmGap) }
+                control?.send(.filmAck(film: film))
+            }
             receiveFilm(info)
+        case .filmChanging(let film, let seq):
+            guard role == .guest else { return }
+            if film != guestFilm || receiver != nil { guestFilmChanged(to: film, seq: seq) }
+            control?.send(.filmAck(film: film))
+            choosingFilm = true
+        case .noFilm(let film, let seq):
+            guard role == .guest else { return }
+            if film != guestFilm || receiver != nil || guestFilm == nil { guestFilmChanged(to: film, seq: seq) }
+            control?.send(.filmAck(film: film))
+            choosingFilm = false
+            preparing = nil
+        case .filmAck(let film):
+            guard role == .host else { return }
+            turn.confirm(film)
+        case .filmHash(let film, let hash):
+            guard role == .guest, film == guestFilm else { return }
+            receiver?.setExpectedHash(hash)
         case .want(let chunks, let urgent, let reset):
+            guard guestIsOnCurrentFilm else { return }
             sender?.request(chunks, urgent: urgent, reset: reset ?? false)
         case .progress(let fraction):
+            guard guestIsOnCurrentFilm else { return }
             transferFraction = fraction
         case .have(let ranges):
-            guard role == .host, let film = sharedFilm else { return }
+            guard role == .host, guestIsOnCurrentFilm, let film = sharedFilm else { return }
             receivedRanges = ChunkMap.fractions(ranges: ranges, chunkCount: ChunkMap.chunkCount(fileSize: film.size, chunkSize: film.chunkSize))
         case .timeline(let timeline):
+            guard guestIsOnCurrentFilm else { return }
             playback.receive(timeline)
         case .heartbeat(let timeline, let actual):
             playback.receiveHeartbeat(timeline, actual: actual)
         case .buffering(let buffering, let position):
+            guard guestIsOnCurrentFilm else { return }
             if awaitingPartnerPosition {
                 awaitingPartnerPosition = false
                 partnerPositionTimeout?.cancel()
@@ -515,13 +846,17 @@ public final class Party: ObservableObject {
                 playback.remoteBuffering(buffering, at: position)
             }
         case .ping(let t0):
-            control?.send(.pong(t0: t0, t1: playback.localNow()))
-        case .pong(let t0, let t1):
-            clock.add(t0: t0, t1: t1, t2: playback.localNow())
-            playback.clockOffset = clock.offset
+            let now = playback.localNow()
+            control?.send(.pong(t0: t0, t1: receivedAt ?? now, hold: receivedAt.map { max(0, now - $0) }))
+        case .pong(let t0, let t1, let hold):
+            clock.add(t0: t0, t1: t1, t2: receivedAt ?? playback.localNow(), hold: hold ?? 0)
+            playback.clockOffset = legacyClockEstimate ? clock.shortestRoundTripOffset : clock.offset
             clockRoundTrip = clock.bestRoundTrip ?? 0
         case .preparing(let fraction):
-            if role == .guest, receiver == nil { preparing = Preparing(fraction: fraction, remuxOnly: false, speed: nil) }
+            if role == .guest, receiver == nil {
+                choosingFilm = false
+                preparing = Preparing(fraction: fraction, remuxOnly: false, speed: nil)
+            }
         case .mediaState(let camera, let mic):
             partnerCameraOn = camera
             partnerMicOn = mic
@@ -537,6 +872,8 @@ public final class Party: ObservableObject {
     private func startClockSync() {
         var count = 0
         pingTimer?.invalidate()
+        // The first one at once: before the film starts to fill the link.
+        control?.send(.ping(t0: playback.localNow()))
         pingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
             guard let self else { return timer.invalidate() }
             count += 1
@@ -547,22 +884,57 @@ public final class Party: ObservableObject {
         }
     }
 
+    // MARK: The film (guest)
+
+    /// Guest: the host moved on to film number `film` (or to none). What
+    /// there was of the film before goes; the call stays as it is.
+    private func guestFilmChanged(to film: Int, seq: Int) {
+        if let receiver {
+            // Lets go of the film's channel too; whatever still arrives on it is for nobody.
+            receiver.cancel()
+            fileChannels[wantedChannel] = nil
+        }
+        receiver = nil
+        clearFilmState()
+        guestFilm = film
+        playback.startOver(at: seq)
+    }
+
+    private func attachReceiver() {
+        guard let receiver, let channel = fileChannels[wantedChannel], receiver.attachedChannel !== channel else { return }
+        receiver.attach(channel)
+    }
+
     private func receiveFilm(_ info: FileInfo) {
         do {
-            let receiver = try FileReceiver(info: info)
+            let receiver = try FileReceiver(info: info, cache: filmCache)
             self.receiver = receiver
+            choosingFilm = false
+            preparing = nil
+            filmNotice = nil
             sharedFilm = info
             filmName = (info.name as NSString).deletingPathExtension
-            receiver.requestChunks = { [weak self] chunks, urgent, jump in self?.control?.send(.want(chunks: chunks, urgent: urgent, reset: jump ? true : nil)) }
-            receiver.onProgress = { [weak self] fraction in
-                self?.transferFraction = fraction
-                self?.control?.send(.progress(fraction: fraction))
+            wantedChannel = info.channel ?? FileInfo.firstChannel
+            // Until the first part has arrived this side counts as buffering, and says so.
+            playback.startBuffering()
+            if info.film != nil { control?.send(.buffering(true, position: 0)) }
+            receiver.requestChunks = { [weak self, weak receiver] chunks, urgent, jump in
+                guard let self, let receiver, receiver === self.receiver else { return }
+                self.control?.send(.want(chunks: chunks, urgent: urgent, reset: jump ? true : nil))
             }
-            receiver.onRanges = { [weak self] ranges, count in
-                self?.receivedRanges = ChunkMap.fractions(ranges: ranges, chunkCount: count)
-                self?.control?.send(.have(ranges: ranges))
+            receiver.onProgress = { [weak self, weak receiver] fraction in
+                guard let self, let receiver, receiver === self.receiver else { return }
+                self.transferFraction = fraction
+                self.control?.send(.progress(fraction: fraction))
             }
-            if let fileChannel { receiver.attach(fileChannel) }
+            receiver.onRanges = { [weak self, weak receiver] ranges, count in
+                guard let self, let receiver, receiver === self.receiver else { return }
+                self.receivedRanges = ChunkMap.fractions(ranges: ranges, chunkCount: count)
+                self.control?.send(.have(ranges: ranges))
+            }
+            // What is here from an earlier session shows at once, on both sides.
+            if receiver.resumedChunks > 0 { receiver.reportNow() }
+            attachReceiver()
             let asset = AVURLAsset(url: receiver.playerURL)
             asset.resourceLoader.setDelegate(receiver, queue: receiver.queue)
             playback.hasEnoughAhead = { [weak self, weak receiver] seconds in
@@ -579,7 +951,8 @@ public final class Party: ObservableObject {
             playback.load(asset: asset)
         } catch {
             Log.debug("receiver failed: \(error)")
-            phase = .ended("Couldn't make room for the film on this Mac (\(error.localizedDescription)).")
+            // The room goes on; only this film cannot be watched here.
+            filmNotice = "There isn't enough room on this Mac for the film. Free up some space, then ask your partner to choose it again."
         }
     }
 }
@@ -587,6 +960,11 @@ public final class Party: ObservableObject {
 extension Party: CallSessionDelegate {
     public func call(_ call: CallSession, wantsToSignal payload: [String: Any]) {
         signaling.signal(payload)
+    }
+
+    public func call(_ call: CallSession, logged state: String) {
+        guard call === self.call else { return }
+        connectionLog.append("call \(callsStarted): \(state)")
     }
 
     public func call(_ call: CallSession, connectionChanged connected: Bool) {
@@ -609,16 +987,23 @@ extension Party: CallSessionDelegate {
     }
 
     public func call(_ call: CallSession, controlChannelOpened channel: RTCDataChannel) {
+        guard call === self.call else { return }
         controlOpened(channel)
     }
 
     public func call(_ call: CallSession, fileChannelOpened channel: RTCDataChannel) {
-        Log.debug("\(role) file channel handed, state \(channel.readyState.rawValue)")
-        fileChannel = channel
-        if role == .host { sender?.attach(channel) } else { receiver?.attach(channel) }
+        guard call === self.call else { return }
+        Log.debug("\(role) film channel \(channel.label) handed, state \(channel.readyState.rawValue)")
+        fileChannels[channel.label] = channel
+        if role == .host {
+            if sender != nil, filmChannelLabel == nil { assignFilmChannel() }
+        } else if channel.label == wantedChannel {
+            attachReceiver()
+        }
     }
 
     public func call(_ call: CallSession, remoteVideoTrack track: RTCVideoTrack) {
+        guard call === self.call else { return }
         remoteVideoTrack = track
     }
 }
@@ -626,19 +1011,45 @@ extension Party: CallSessionDelegate {
 /// Wraps the "control" data channel: JSON messages, queued until it opens.
 final class ControlChannel: NSObject, RTCDataChannelDelegate {
     private let channel: RTCDataChannel
-    private let onMessage: (ControlMessage) -> Void
+    private let now: () -> Double
+    private let onMessage: (ControlMessage, Double) -> Void
     private var queue: [ControlMessage] = []
+    private var announcedOpen = false
+    /// Called once, on the main queue, when the channel can carry messages (at once if it already can).
+    var onOpen: (() -> Void)? { didSet { DispatchQueue.main.async { self.noteOpen() } } }
 
-    init(channel: RTCDataChannel, onMessage: @escaping (ControlMessage) -> Void) {
+    /// `now`: this side's clock; read on WebRTC's thread the moment a message arrives.
+    init(channel: RTCDataChannel, now: @escaping () -> Double, onMessage: @escaping (ControlMessage, Double) -> Void) {
         self.channel = channel
+        self.now = now
         self.onMessage = onMessage
         super.init()
         ChannelRelay.attach(channel, to: self)
     }
 
+    private func noteOpen() {
+        guard !announcedOpen, channel.readyState == .open, let onOpen else { return }
+        announcedOpen = true
+        onOpen()
+    }
+
+    /// Test hook (SAMESOFA_TEST_CONTROL_DELAY_MS): every message leaves this much later, in
+    /// order, as it would arrive over a real network instead of loopback.
+    private static let testDelay: Double = (ProcessInfo.processInfo.environment["SAMESOFA_TEST_CONTROL_DELAY_MS"].flatMap(Double.init) ?? 0) / 1000
+    private var delayed = 0
+
     func send(_ message: ControlMessage) {
-        queue.append(message)
-        flush()
+        guard Self.testDelay > 0 else {
+            queue.append(message)
+            flush()
+            return
+        }
+        delayed += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.testDelay) {
+            self.delayed -= 1
+            self.queue.append(message)
+            self.flush()
+        }
     }
 
     private var retryScheduled = false
@@ -669,11 +1080,15 @@ final class ControlChannel: NSObject, RTCDataChannelDelegate {
     }
 
     func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
-        DispatchQueue.main.async { self.flush() }
+        DispatchQueue.main.async {
+            self.flush()
+            self.noteOpen()
+        }
     }
 
     func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
+        let at = now()
         guard let message = ControlMessage.decode(buffer.data) else { return }
-        DispatchQueue.main.async { self.onMessage(message) }
+        DispatchQueue.main.async { self.onMessage(message, at) }
     }
 }

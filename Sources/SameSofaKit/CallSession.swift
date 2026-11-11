@@ -46,11 +46,20 @@ public protocol CallSessionDelegate: AnyObject {
     func call(_ call: CallSession, controlChannelOpened channel: RTCDataChannel)
     func call(_ call: CallSession, fileChannelOpened channel: RTCDataChannel)
     func call(_ call: CallSession, remoteVideoTrack track: RTCVideoTrack)
+    /// "ice connected", "peer connected" and the like, as they happen (diagnostics, tests).
+    func call(_ call: CallSession, logged state: String)
 }
 
-/// One WebRTC peer connection: camera + microphone both ways and two data
-/// channels ("control" for small JSON messages, "file" for the film's bytes).
-/// The host makes the offer and creates the data channels.
+public extension CallSessionDelegate {
+    func call(_ call: CallSession, logged state: String) {}
+}
+
+/// One WebRTC peer connection: camera + microphone both ways, a "control"
+/// data channel for small JSON messages and one data channel per film for
+/// its bytes ("file" for the first film of a connection, as before 1.3;
+/// "film-<n>" for every later one, opened when the host changes film and
+/// closed when that film is over, so nothing of one film can arrive in
+/// another). The host makes the offer and creates the data channels.
 public final class CallSession: NSObject, RTCPeerConnectionDelegate {
     public weak var delegate: CallSessionDelegate?
     public let role: PeerRole
@@ -187,7 +196,18 @@ public final class CallSession: NSObject, RTCPeerConnectionDelegate {
 
     private func hand(_ channel: RTCDataChannel) {
         if channel.label == "control" { delegate?.call(self, controlChannelOpened: channel) }
-        if channel.label == "file" { delegate?.call(self, fileChannelOpened: channel) }
+        if FileInfo.isFilmChannel(channel.label) { delegate?.call(self, fileChannelOpened: channel) }
+    }
+
+    /// Host: a channel for another film on the same connection (nothing is
+    /// renegotiated; the guest is handed it like the first one).
+    public func openFilmChannel(label: String) -> RTCDataChannel? {
+        guard let pc, FileInfo.isFilmChannel(label) else { return nil }
+        let config = RTCDataChannelConfiguration()
+        config.isOrdered = true
+        guard let channel = pc.dataChannel(forLabel: label, configuration: config) else { return nil }
+        ChannelRelay.install(on: channel)
+        return channel
     }
 
     // MARK: Negotiation
@@ -268,6 +288,7 @@ public final class CallSession: NSObject, RTCPeerConnectionDelegate {
         @unknown default: name = "unknown"
         }
         Self.logger.info("ICE state: \(name, privacy: .public)")
+        DispatchQueue.main.async { self.delegate?.call(self, logged: "ice \(name)") }
         if newState == .connected || newState == .completed { logSelectedPairType(peerConnection) }
     }
 
@@ -288,7 +309,18 @@ public final class CallSession: NSObject, RTCPeerConnectionDelegate {
     }
 
     public func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCPeerConnectionState) {
+        let name: String
+        switch newState {
+        case .new: name = "new"
+        case .connecting: name = "connecting"
+        case .connected: name = "connected"
+        case .disconnected: name = "disconnected"
+        case .failed: name = "failed"
+        case .closed: name = "closed"
+        @unknown default: name = "unknown"
+        }
         DispatchQueue.main.async {
+            self.delegate?.call(self, logged: "peer \(name)")
             switch newState {
             case .connected: self.delegate?.call(self, connectionChanged: true)
             case .failed, .disconnected, .closed: self.delegate?.call(self, connectionChanged: false)

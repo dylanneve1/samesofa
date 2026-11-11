@@ -52,16 +52,40 @@ public struct FileInfo: Codable, Equatable, Sendable {
     /// film playable? nil when the host's app is too old to say (before 1.2).
     public var videoConverted: Bool?
     public var audioConverted: Bool?
+    // Since 1.3 (all nil from older hosts, ignored by older guests):
+    /// Which film of this room this is. Counts up every time the host
+    /// changes or closes the film, so both sides know what belongs to what.
+    public var film: Int?
+    /// Label of the data channel this film's bytes arrive on (nil: "file").
+    public var channel: String?
+    /// Sequence number the film's timeline starts at; everything sent for
+    /// an earlier film has a lower one.
+    public var seq: Int?
+    /// Size and a hash of sampled blocks of the bytes being sent: the same
+    /// film shared again has the same fingerprint, so a guest that still has
+    /// (part of) it only fetches what is missing.
+    public var fingerprint: String?
 
     public init(size: Int64, name: String, uti: String, chunkSize: Int = ChunkFrame.defaultChunkSize,
-                videoConverted: Bool? = nil, audioConverted: Bool? = nil) {
+                videoConverted: Bool? = nil, audioConverted: Bool? = nil,
+                film: Int? = nil, channel: String? = nil, seq: Int? = nil, fingerprint: String? = nil) {
         self.size = size
         self.name = name
         self.uti = uti
         self.chunkSize = chunkSize
         self.videoConverted = videoConverted
         self.audioConverted = audioConverted
+        self.film = film
+        self.channel = channel
+        self.seq = seq
+        self.fingerprint = fingerprint
     }
+
+    /// The label of the first film channel of a call (the only one before 1.3).
+    public static let firstChannel = "file"
+    /// Labels of the channels opened for later films.
+    public static let laterChannelPrefix = "film-"
+    public static func isFilmChannel(_ label: String) -> Bool { label == firstChannel || label.hasPrefix(laterChannelPrefix) }
 
     public var chunkCount: Int { Int((size + Int64(chunkSize) - 1) / Int64(chunkSize)) }
 }
@@ -91,18 +115,36 @@ public enum ControlMessage: Codable, Equatable, Sendable {
     case buffering(Bool, position: Double)
     /// Clock sync: guest sends ping with its own time, host answers with its time.
     case ping(t0: Double)
-    case pong(t0: Double, t1: Double)
+    /// `t1`: the host's clock when the ping arrived. `hold` (since 1.3): how long
+    /// the host kept it before answering, so that this wait is not taken for network delay.
+    case pong(t0: Double, t1: Double, hold: Double? = nil)
     /// Camera on/off and mic mute state, so the other side can show it.
     case mediaState(cameraOn: Bool, micOn: Bool)
     /// Host -> guest: the film is still being converted (MKV, AVI, ...); 0...1.
     /// Older apps ignore it and simply wait for `fileInfo`.
     case preparing(fraction: Double)
     case bye
+    // Since 1.3 (protocol 3). Older apps cannot decode these and ignore them.
+    /// Host -> guest: the film (if any) is over; film number `film` is being
+    /// looked at and will follow. Its timeline starts at `seq`.
+    case filmChanging(film: Int, seq: Int)
+    /// Host -> guest: no film at the moment; the room and the call go on.
+    case noFilm(film: Int, seq: Int)
+    /// Guest -> host: "from here on everything I send is about film `film`".
+    /// Until it arrives the host ignores the guest's transfer and playback
+    /// messages: they are about the film before.
+    case filmAck(film: Int)
+    /// Host -> guest: SHA-256 of the whole film, to check a finished copy against.
+    case filmHash(film: Int, sha256: String)
 
     /// 1: SameSofa 1.0 to 1.2.0. 2: 1.2.1 (reconnecting in the same room,
-    /// seeks that drop queued chunks). Versions only add optional things, so
-    /// different versions still work together; they just say so.
-    public static let protocolVersion = 2
+    /// seeks that drop queued chunks). 3: 1.3 (rooms without a film, changing
+    /// film without leaving, resuming a film). Versions only add optional
+    /// things, so different versions still work together; they just say so.
+    public static let protocolVersion = 3
+    /// From this version on a partner can be in a room without a film and
+    /// follow a change of film.
+    public static let filmChangeVersion = 3
     /// Partners older than this cannot be watched with at all.
     public static let oldestCompatibleVersion = 1
 
@@ -121,9 +163,22 @@ public enum ControlMessage: Codable, Equatable, Sendable {
             return .incompatible("Your partner's SameSofa is too old to watch together with this one. Ask them to update, then try again.")
         }
         if theirs < ours {
+            if theirs < filmChangeVersion, ours >= filmChangeVersion {
+                return .note("Your partner needs SameSofa 1.3 for rooms without a film and for changing film. Other things may not work either until they update.")
+            }
             return .note("Your partner has an older SameSofa. Some things may not work until they update.")
         }
         return .note("Your partner has a newer SameSofa. Some things may not work until you update.")
+    }
+
+    /// The note for the host of a room whose guest is too old for rooms
+    /// without a film (protocol 2 and earlier): says what to do right now.
+    /// nil when the partner can do everything this copy can.
+    public static func oldPartnerNote(theirs: Int, hasFilm: Bool, ours: Int = protocolVersion) -> String? {
+        guard theirs < filmChangeVersion, ours >= filmChangeVersion else { return nil }
+        return hasFilm
+            ? "Your partner needs SameSofa 1.3 for changing film. To watch something else with them now, leave and start again."
+            : "Your partner needs SameSofa 1.3 for rooms without a film. Choose a film and you can watch it together."
     }
 
     public func encoded() -> Data {
