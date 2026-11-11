@@ -274,4 +274,15 @@ final class SyncTests: XCTestCase {
                        "Receiving the film: 0 B of 2.1 GB · 0.0%")
         XCTAssertEqual(TransferText.percent(0.5), "50%")
     }
+
+    func testWantStaysCompatibleWithOlderApps() throws {
+        // A 1.2.0 guest's message (no reset field) still decodes.
+        let old = Data(#"{"want":{"chunks":[1,2],"urgent":true}}"#.utf8)
+        XCTAssertEqual(ControlMessage.decode(old), .want(chunks: [1, 2], urgent: true, reset: nil))
+        // A new message carries the extra key that a 1.2.0 decoder simply ignores.
+        let new = ControlMessage.want(chunks: [3], urgent: true, reset: true).encoded()
+        XCTAssertEqual(ControlMessage.decode(new), .want(chunks: [3], urgent: true, reset: true))
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: new) as? [String: Any])
+        XCTAssertNotNil((json["want"] as? [String: Any])?["urgent"])
+    }
 }
