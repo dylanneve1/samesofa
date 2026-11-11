@@ -305,6 +305,191 @@ final class RoomSuite {
         host.leave()
         finish()
     }
+
+    // MARK: Resuming
+
+    /// Ends a session the way quitting both apps does.
+    func quit(_ host: Party, _ guest: Party) {
+        guest.leave()
+        host.leave()
+        spin(0.5)
+    }
+
+    func loaded(_ host: Party, _ guest: Party, _ timeout: Double = 90) -> Bool {
+        wait(timeout) { guest.sharedFilm != nil && guest.sharedFilm?.film == host.turn.current && guest.playback.isLoaded && host.playback.isLoaded }
+    }
+
+    func runResume(filmA: URL, filmB: URL, rewrapped: URL, converted: URL) -> Never {
+        let shaA = sha256(filmA)
+
+        // 1. The guest quits with part of the film, in pieces; both come back.
+        throttle(1_500_000)
+        var have = 0, ranges = 0, fingerprint = ""
+        if let (host, guest) = pair(hostCache: cache("h1"), guestCache: cache("g1"), label: "first session") {
+            host.changeFilm(to: filmA)
+            check("first session: film A loads", loaded(host, guest))
+            guest.playback.play()
+            wait(20) { self.bothPlaying(host, guest) }
+            host.playback.seek(to: host.playback.duration * 0.7)
+            check("first session: the guest has the film in separate pieces", wait(30) { guest.receivedRanges.count >= 2 && guest.transferFraction > 0.25 }
+                  && guest.transferFraction < 0.9,
+                  guest.receivedRanges.map { String(format: "%.0f-%.0f%%", $0.lowerBound * 100, $0.upperBound * 100) }.joined(separator: " "))
+            have = guest.receiver?.status.received ?? 0
+            ranges = guest.receivedRanges.count
+            fingerprint = guest.sharedFilm?.fingerprint ?? ""
+            check("the film is kept in the guest's cache while it is received", guest.receiver?.status.isKept == true && !fingerprint.isEmpty)
+            quit(host, guest)
+        }
+        let kept = cache("g1").entries
+        check("after quitting: the partial copy is on disk, not in use", kept.count == 1 && kept.first?.inUse == false && (kept.first?.bytes ?? 0) > 0,
+              kept.map { "\($0.bytes >> 20) MB" }.joined(separator: ", "))
+        var guestCache = cache("g1")
+        if let (host, guest) = pair(hostCache: cache("h1"), guestCache: guestCache, label: "after both relaunched") {
+            var firstRanges: [ClosedRange<Double>] = [], firstHostRanges: [ClosedRange<Double>] = []
+            host.changeFilm(to: filmA)
+            let ok = wait(60) {
+                if firstRanges.isEmpty, !guest.receivedRanges.isEmpty { firstRanges = guest.receivedRanges }
+                if firstHostRanges.isEmpty, !host.receivedRanges.isEmpty { firstHostRanges = host.receivedRanges }
+                return guest.sharedFilm != nil && guest.playback.isLoaded && !firstHostRanges.isEmpty
+            }
+            let status = guest.receiver?.status ?? .init()
+            check("guest relaunched: the partial copy is found again", ok && status.resumed >= have && status.resumed <= have + 40
+                    && guest.sharedFilm?.fingerprint == fingerprint, "\(status.resumed) of \(status.chunkCount) chunks (had \(have) when it quit)")
+            check("guest relaunched: the seek bar shows the pieces at once, on both sides", firstRanges.count >= 2 && ranges >= 2
+                    && firstHostRanges.count == firstRanges.count,
+                  firstRanges.map { String(format: "%.0f-%.0f%%", $0.lowerBound * 100, $0.upperBound * 100) }.joined(separator: " "))
+            check("guest relaunched: the rest arrives", wait(120) { guest.receiver?.isComplete == true })
+            if let receiver = guest.receiver {
+                let s = receiver.status
+                check("guest relaunched: only the missing chunks were fetched", s.fetched == s.chunkCount - s.resumed, "\(s.fetched) fetched, \(s.resumed) resumed")
+                check("guest relaunched: byte-identical", sha256(receiver.cacheURL) == shaA && shaA != "unreadable")
+                check("guest relaunched: checked against the host's hash", wait(20) { receiver.status.verified == true })
+            }
+            guest.playback.play()
+            check("guest relaunched: plays in sync", wait(30) { self.bothPlaying(host, guest) } && { spin(2); return drift(host, guest) < 0.25 }())
+            quit(host, guest)
+        }
+
+        // 2. The host quits and comes back (a new room); the guest's app kept running.
+        if let (host, guest) = pair(hostCache: cache("h1"), guestCache: guestCache, label: "after the host relaunched") {
+            let t0 = Date()
+            host.changeFilm(to: filmA)
+            check("host relaunched: the guest's complete copy is used", loaded(host, guest) && wait(10) { guest.receiver?.isComplete == true },
+                  String(format: "ready after %.1f s", Date().timeIntervalSince(t0)))
+            let s = guest.receiver?.status ?? .init()
+            check("host relaunched: nothing is fetched, nothing is sent", s.fetched == 0 && s.resumed == s.chunkCount && host.chunksSent == 0, "\(s.fetched) fetched")
+            check("host relaunched: checked against the host's hash again", wait(20) { guest.receiver?.status.verified == true })
+            quit(host, guest)
+        }
+
+        // 3. A kept copy that got damaged on disk: found out by the hash, fetched again.
+        if let file = try? FileManager.default.contentsOfDirectory(at: work.appendingPathComponent("g1/received"), includingPropertiesForKeys: nil).first?
+            .appendingPathComponent("film.bin"), let handle = try? FileHandle(forWritingTo: file) {
+            try? handle.seek(toOffset: 5_000_000)
+            try? handle.write(contentsOf: Data(repeating: 0xAA, count: 3000))
+            try? handle.close()
+            guestCache = cache("g1")
+            if let (host, guest) = pair(hostCache: cache("h1"), guestCache: guestCache, label: "damaged copy") {
+                host.changeFilm(to: filmA)
+                check("damaged copy: taken at first (it is complete)", loaded(host, guest) && guest.receiver?.status.resumed == guest.receiver?.status.chunkCount)
+                check("damaged copy: the hash does not match, the kept part is fetched again", wait(120) {
+                    let s = guest.receiver?.status ?? .init()
+                    return s.refetches == 1 && s.received == s.chunkCount && s.verified == true
+                }, "\(guest.receiver?.status.fetched ?? 0) chunks fetched")
+                if let receiver = guest.receiver { check("damaged copy: byte-identical in the end", sha256(receiver.cacheURL) == shaA) }
+                quit(host, guest)
+            }
+        } else {
+            check("damaged copy: the kept file is where it should be", false)
+        }
+
+        // 4. Converted films. The host keeps what it converted: sharing the film again
+        //    converts nothing and sends the very same bytes, so the guest's copy still fits.
+        throttle(nil)
+        for (film, label, partial) in [(rewrapped, "rewrapped MKV", false), (converted, "converted MKV", true)] {
+            var first = "", sharedPath = "", sentSha = "", haveBefore = 0
+            let hostRoot = "h-\(label.prefix(3))", guestRoot = "g-\(label.prefix(3))"
+            if partial { throttle(250_000) } else { throttle(nil) }
+            if let (host, guest) = pair(hostCache: cache(hostRoot), guestCache: cache(guestRoot), label: label) {
+                let t0 = Date()
+                host.changeFilm(to: film)
+                let ok = wait(180) { host.sharedFilm != nil }
+                let took = Date().timeIntervalSince(t0)
+                check("\(label): prepared on the host and kept in its cache", ok && host.conversionsRun == 1 && (host.sharedFile?.path.contains("/\(hostRoot)/prepared/") ?? false),
+                      String(format: "%.1f s", took))
+                first = host.sharedFilm?.fingerprint ?? ""
+                sharedPath = host.sharedFile?.path ?? ""
+                sentSha = host.sharedFile.map(sha256) ?? ""
+                if partial {
+                    check("\(label): the guest has part of it", wait(60) { guest.transferFraction > 0.3 } && guest.transferFraction < 0.95,
+                          String(format: "%.0f%%", guest.transferFraction * 100))
+                    haveBefore = guest.receiver?.status.received ?? 0
+                } else {
+                    check("\(label): arrives completely", wait(120) { guest.receiver?.isComplete == true })
+                    check("\(label): byte-identical to what the host converted", guest.receiver.map { sha256($0.cacheURL) } == sentSha && sentSha != "unreadable")
+                }
+                quit(host, guest)
+            }
+            check("\(label): the converted film stays on the host after the session", FileManager.default.fileExists(atPath: sharedPath))
+            throttle(nil)
+            if let (host, guest) = pair(hostCache: cache(hostRoot), guestCache: cache(guestRoot), label: "\(label) again") {
+                let t0 = Date()
+                host.changeFilm(to: film)
+                let ok = wait(60) { host.sharedFilm != nil }
+                check("\(label) again: not converted a second time, the same bytes are shared", ok && host.conversionsRun == 0 && host.sharedFile?.path == sharedPath
+                        && host.sharedFilm?.fingerprint == first && !first.isEmpty, String(format: "shared after %.1f s", Date().timeIntervalSince(t0)))
+                check("\(label) again: loads on the guest", loaded(host, guest) && wait(120) { guest.receiver?.isComplete == true })
+                let s = guest.receiver?.status ?? .init()
+                if partial {
+                    check("\(label) again: the guest's partial copy is completed, only the missing chunks fetched",
+                          s.resumed >= haveBefore && s.resumed > 0 && s.fetched == s.chunkCount - s.resumed, "\(s.fetched) fetched, \(s.resumed) resumed")
+                } else {
+                    check("\(label) again: nothing is fetched", s.fetched == 0 && s.resumed == s.chunkCount, "\(s.fetched) fetched")
+                }
+                check("\(label) again: byte-identical and checked", guest.receiver.map { sha256($0.cacheURL) } == sentSha
+                        && wait(20) { guest.receiver?.status.verified == true })
+                host.playback.play()
+                check("\(label) again: plays in sync", wait(30) { self.bothPlaying(host, guest) } && { spin(2); return drift(host, guest) < 0.25 }())
+                quit(host, guest)
+            }
+        }
+
+        // 5. The size limit. Film A is about 37 MB, film B about 20 MB.
+        let sizeA = Int64((try? FileManager.default.attributesOfItem(atPath: filmA.path)[.size] as? NSNumber)??.int64Value ?? 0)
+        let sizeB = Int64((try? FileManager.default.attributesOfItem(atPath: filmB.path)[.size] as? NSNumber)??.int64Value ?? 0)
+        let limited = cache("g-cap", capacity: sizeA + sizeB / 2)
+        if let (host, guest) = pair(hostCache: cache("h1"), guestCache: limited, label: "size limit") {
+            host.changeFilm(to: filmA)
+            check("size limit: film A arrives and is kept", loaded(host, guest) && wait(120) { guest.receiver?.isComplete == true } && limited.entries.count == 1)
+            host.changeFilm(to: filmB)
+            check("size limit: film B arrives", loaded(host, guest) && wait(120) { guest.receiver?.isComplete == true })
+            let entries = limited.entries
+            check("size limit: the older film made room for the new one", entries.count == 1 && guest.receiver?.status.isKept == true
+                    && limited.totalBytes <= limited.capacity, "\(entries.count) kept, \(limited.totalBytes >> 20) MB of \(limited.capacity >> 20) MB")
+            // A film in use is never removed, however small the limit becomes.
+            limited.capacity = 1 << 20
+            limited.sweep()
+            check("size limit: the film being watched is never removed", limited.entries.count == 1 && FileManager.default.fileExists(atPath: guest.receiver?.cacheURL.path ?? "/nope"))
+            // Bigger than the limit: received as before 1.3, into a temporary file that goes with the film.
+            host.changeFilm(to: filmA)
+            check("size limit: a film bigger than the limit still plays", loaded(host, guest))
+            let temporary = guest.receiver?.cacheURL
+            check("size limit: it is not kept", guest.receiver?.status.isKept == false && !(temporary?.path.contains("/g-cap/") ?? true))
+            host.closeFilm()
+            check("size limit: its temporary file goes when the film is closed", wait(10) { guest.receiver == nil }
+                  && !FileManager.default.fileExists(atPath: temporary?.path ?? "/nope"))
+            quit(host, guest)
+        }
+        // After 24 hours without use a kept film goes.
+        let aged = cache("g1")
+        let before = aged.entries
+        for entry in before { aged.setLastUsedForTesting(entry.id, Date().addingTimeInterval(-25 * 3600)) }
+        aged.sweep()
+        check("a kept film not used for 24 hours is removed", !before.isEmpty && aged.entries.isEmpty, "\(before.count) before, \(aged.entries.count) after")
+        let switchedOff = cache("g-off", capacity: 0)
+        check("with keeping switched off nothing is kept", switchedOff.openReceived(info: FileInfo(size: 1000, name: "x.mp4", uti: "public.mpeg-4", fingerprint: "abc")) == nil)
+        finish()
+    }
 }
 
 /// Counts decoded remote video frames.

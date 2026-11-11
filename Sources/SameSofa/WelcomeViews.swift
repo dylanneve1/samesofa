@@ -22,18 +22,22 @@ struct WelcomeView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        VStack(spacing: 44) {
+        VStack(spacing: 40) {
             Spacer()
             Wordmark()
-            HStack(spacing: 22) {
+            HStack(spacing: 20) {
                 BigChoice(icon: "person.2.fill", title: "Join",
                           subtitle: "Your partner gives you a code", primary: true) {
                     model.screen = .join
                 }
                 .keyboardShortcut(.defaultAction)
-                BigChoice(icon: "film.stack", title: "Host",
+                BigChoice(icon: "sofa.fill", title: "Start a room",
+                          subtitle: "See each other now, choose a film later", primary: false) {
+                    model.startRoom()
+                }
+                BigChoice(icon: "film.stack", title: "Host a film",
                           subtitle: "Pick a film on this Mac", primary: false) {
-                    model.chooseFilmAndHost()
+                    model.chooseFilm()
                 }
             }
             if model.inspecting {
@@ -57,7 +61,7 @@ struct WelcomeView: View {
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                if let url { DispatchQueue.main.async { model.startHosting(film: url) } }
+                if let url { DispatchQueue.main.async { model.openFilm(url) } }
             }
             return true
         }
@@ -81,12 +85,17 @@ struct BigChoice: View {
                     .foregroundStyle(primary ? Color.black.opacity(0.8) : Theme.accent)
                 Text(title)
                     .font(.system(size: 26, weight: .semibold, design: .rounded))
+                // Room for two lines on every card, so the titles line up.
                 Text(subtitle)
                     .font(.body)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .frame(height: 40, alignment: .top)
                     .foregroundStyle(primary ? Color.black.opacity(0.6) : Theme.secondaryText)
             }
             .foregroundStyle(primary ? Color.black.opacity(0.85) : .white)
-            .frame(width: 250, height: 190)
+            .padding(.horizontal, 18)
+            .frame(width: 236, height: 200)
             .background(
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
                     .fill(primary ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.card))

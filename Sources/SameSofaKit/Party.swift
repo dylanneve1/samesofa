@@ -231,7 +231,10 @@ public final class Party: ObservableObject {
     /// if any, ends on both sides at once; the call and the room go on. The
     /// file is looked at, converted if need be, then shared.
     public func changeFilm(to film: URL, inspect: @escaping (URL) async throws -> FilmCheck = { try await FilmPreparer.inspect($0) }) {
-        guard role == .host, canChangeFilm else { return }
+        guard role == .host, canChangeFilm else {
+            Log.debug("\(role) change of film refused: the partner's copy is too old to follow")
+            return
+        }
         let number = beginFilmChange(name: film.deletingPathExtension().lastPathComponent)
         Task { @MainActor in
             do {
@@ -262,7 +265,11 @@ public final class Party: ObservableObject {
 
     /// Host: stop watching this film. Both go back to just being in the room together.
     public func closeFilm() {
-        guard role == .host, canChangeFilm, hasFilmActivity else { return }
+        guard role == .host, canChangeFilm, hasFilmActivity else {
+            if role == .host, !canChangeFilm { Log.debug("\(role) closing the film refused: the partner's copy is too old to follow") }
+            return
+        }
+        Log.debug("host: film \(turn.current) closed")
         endFilm()
         sendFilmState()
     }
@@ -273,6 +280,7 @@ public final class Party: ObservableObject {
         endFilm()
         choosingFilm = true
         filmName = name
+        Log.debug("host: film \(turn.current) chosen")
         sendFilmState()
         return turn.current
     }
@@ -353,6 +361,7 @@ public final class Party: ObservableObject {
                     self.control?.send(.preparing(fraction: fraction))
                 }
             }
+            conversionsRun += 1
             preparer.start { [weak self, weak preparer] result in
                 guard let self, let preparer, preparer === self.preparer else { return }
                 self.preparer = nil
@@ -403,6 +412,7 @@ public final class Party: ObservableObject {
         playback.load(asset: AVURLAsset(url: file))
         assignFilmChannel()
         sharedFilm = announcedInfo()
+        Log.debug("host: film \(turn.current) shared (\(sender.info.chunkCount) chunks)")
         sendFilmState()
         refreshVersionNote()
         let number = turn.current
@@ -671,6 +681,8 @@ public final class Party: ObservableObject {
         connectionDropped()
     }
 
+    /// Host: how many films had to be converted (rewrapped or re-encoded) in this room; one found in the cache does not count.
+    public private(set) var conversionsRun = 0
     /// Host: chunks of the current film handed to its channel so far (diagnostics, tests).
     public var chunksSent: Int { sender?.chunksSent ?? 0 }
     /// Host: the label of the channel the current film is sent on (diagnostics, tests).
@@ -770,6 +782,8 @@ public final class Party: ObservableObject {
     private var guestIsOnCurrentFilm: Bool { role == .guest || turn.guestIsOnCurrentFilm }
 
     private func refreshVersionNote() {
+        let before = versionNote
+        defer { if versionNote != before, let versionNote { Log.debug("\(role) version note: \(versionNote)") } }
         guard let partnerVersion else { versionNote = nil; return }
         switch ControlMessage.compatibility(with: partnerVersion) {
         case .same, .incompatible: versionNote = nil

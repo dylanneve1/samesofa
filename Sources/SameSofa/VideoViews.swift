@@ -34,6 +34,8 @@ struct PlayerSurface: NSViewRepresentable {
     }
 
     final class PlayerNSView: NSView {
+        /// The film's view, for whoever has to know whether the picture is really being shown.
+        static weak var current: PlayerNSView?
         let playerLayer = AVPlayerLayer()
         private var displayLink: CADisplayLink?
         private var pacedFrameRate = 0.0
@@ -70,6 +72,7 @@ struct PlayerSurface: NSViewRepresentable {
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
+            if window != nil { PlayerNSView.current = self }
             let rate = pacedFrameRate
             pacedFrameRate = 0
             setPacing(frameRate: rate)
@@ -101,6 +104,9 @@ struct RTCVideoSurface: NSViewRepresentable {
     let track: RTCVideoTrack?
     var cornerRadius: CGFloat = 16
     var mirrored = false
+    /// Told the size of the picture whenever it changes (the view stretches the picture to its own
+    /// bounds, so whoever lays it out at full size gives it the picture's shape).
+    var onVideoSize: ((CGSize) -> Void)?
 
     func makeNSView(context: Context) -> Container {
         Container(cornerRadius: cornerRadius, mirrored: mirrored)
@@ -108,6 +114,7 @@ struct RTCVideoSurface: NSViewRepresentable {
 
     func updateNSView(_ view: Container, context: Context) {
         view.layer?.cornerRadius = cornerRadius
+        view.onVideoSize = onVideoSize
         view.setTrack(track)
     }
 
@@ -115,9 +122,15 @@ struct RTCVideoSurface: NSViewRepresentable {
         view.setTrack(nil)
     }
 
-    final class Container: NSView {
+    final class Container: NSView, RTCVideoViewDelegate {
         private let video = RTCMTLNSVideoView(frame: .zero)
         private weak var track: RTCVideoTrack?
+        var onVideoSize: ((CGSize) -> Void)?
+
+        func videoView(_ videoView: RTCVideoRenderer, didChangeVideoSize size: CGSize) {
+            guard size.width > 0, size.height > 0 else { return }
+            DispatchQueue.main.async { self.onVideoSize?(size) }
+        }
 
         init(cornerRadius: CGFloat, mirrored: Bool) {
             super.init(frame: .zero)
@@ -126,6 +139,7 @@ struct RTCVideoSurface: NSViewRepresentable {
             layer?.masksToBounds = true
             layer?.backgroundColor = NSColor(white: 0.12, alpha: 1).cgColor
             video.wantsLayer = true
+            video.delegate = self
             addSubview(video)
             if mirrored {
                 // Self-view is mirrored, like every video call.

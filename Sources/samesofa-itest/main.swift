@@ -78,6 +78,11 @@ if let list = args["room-test"], let server = args["server"].flatMap(URL.init(st
     guard films.count == 2 else { print("usage: --room-test a.mp4,b.mp4"); exit(2) }
     RoomSuite(server: server).runRoom(filmA: films[0], filmB: films[1])
 }
+if let list = args["resume-test"], let server = args["server"].flatMap(URL.init(string:)) {
+    let films = list.split(separator: ",").map { URL(fileURLWithPath: String($0)) }
+    guard films.count == 4 else { print("usage: --resume-test a.mp4,b.mp4,rewrapped.mkv,converted.mkv"); exit(2) }
+    RoomSuite(server: server).runResume(filmA: films[0], filmB: films[1], rewrapped: films[2], converted: films[3])
+}
 
 guard let server = args["server"].flatMap(URL.init(string:)), let filmPath = args["film"] else {
     print("usage: samesofa-itest --server ws://127.0.0.1:8787 --film test.mp4 [--soak seconds] [--throttle bytesPerSecond]")
@@ -218,6 +223,42 @@ func runControlStress(count: Int) {
                count, lost, lostTies, lostOther, reissued, p50, p95, latencies.last ?? 0, guest.transferFraction * 100))
     check("no command is lost in \(count)", lost == 0, "\(lost) lost")
     check("control latency p95 < 250 ms", p95 < 250, String(format: "p50 %.0f p95 %.0f max %.0f", p50, p95, latencies.last ?? 0))
+    guest.leave()
+    host.leave()
+    finish()
+}
+
+/// Both press something at the same moment, `count` times: the host pauses or plays, the guest seeks. The two
+/// timelines get the same sequence number and the host's wins; the guest's seek must still happen.
+/// (With --no-reissue this shows what 1.2.1 did: the seek vanished.)
+func runTieStress(count: Int) {
+    var seeksAdopted = Set<Int>()
+    var round = 0
+    let dur = max(10, host.playback.duration)
+    func target(_ i: Int) -> Double { (dur * Double(i % 7 + 1) / 9 * 100).rounded() / 100 }
+    host.playback.onRemoteTimeline = { t, ok in if ok, t.origin == .guest, abs(t.position - target(round)) < 0.005 { seeksAdopted.insert(round) } }
+    var lost = 0, ties = 0
+    for i in 0..<count {
+        round = i
+        let before = guest.playback.reissuedCommands
+        if i % 2 == 0 { host.playback.pause() } else { host.playback.play() }
+        let hostSeq = host.playback.engine.timeline.seq
+        guest.playback.seek(to: target(i))
+        if guest.playback.engine.timeline.seq == hostSeq { ties += 1 }
+        if !wait(2, { seeksAdopted.contains(i) }) {
+            lost += 1
+            if lost <= 5 { log("LOST seek \(i): guest asked for \(target(i)) s, host is at \(host.playback.engine.timeline.position) s (seq \(host.playback.engine.timeline.seq))") }
+        }
+        _ = before
+        spin(0.1)
+    }
+    log("tie stress: \(count) simultaneous presses, \(ties) ties, \(lost) of the guest's seeks lost, \(guest.playback.reissuedCommands) given again")
+    check("simultaneous presses really tie", ties >= count * 9 / 10, "\(ties) of \(count)")
+    if args["no-reissue"] != nil {
+        check("1.2.1 behaviour: a seek that loses a tie vanishes", lost >= ties * 9 / 10, "\(lost) lost of \(ties) ties")
+    } else {
+        check("no press is lost to a tie", lost == 0, "\(lost) lost, \(guest.playback.reissuedCommands) given again")
+    }
     guest.leave()
     host.leave()
     finish()
@@ -423,6 +464,7 @@ if args["clock-only"] != nil {
 }
 if args["control-latency"] != nil { runControlLatency() }
 if let n = args["control-stress"] { runControlStress(count: Int(n) ?? 500) }
+if let n = args["tie-stress"] { runTieStress(count: Int(n) ?? 100) }
 if args["seek-test"] != nil { runSeekScenario() }
 if args["reconnect-test"] != nil { runReconnectScenario() }
 if throttled { runBufferingScenario() }

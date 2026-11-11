@@ -42,6 +42,20 @@ struct SettingsView: View {
             } header: { Text("Video") }
 
             Section {
+                Picker("Keep films to resume them", selection: $settings.keepFilmsGB) {
+                    Text("Off").tag(0.0)
+                    Text("5 GB").tag(5.0)
+                    Text("20 GB").tag(20.0)
+                    Text("50 GB").tag(50.0)
+                }
+                .pickerStyle(.segmented)
+                .help("How much disk space films kept for resuming may take")
+                Text("A film your partner shares stays on this Mac for 24 hours, so that if you watch it again (or the app is reopened in the middle) only the missing part is sent. Films you converted to share are kept the same way. The oldest go first when the limit is reached.")
+                    .font(.caption).foregroundStyle(.secondary)
+                KeptFilmsRow()
+            } header: { Text("Films") }
+
+            Section {
                 TextField("Server address", text: $settings.serverURL, prompt: Text(AppSettings.placeholderServer))
                     .textFieldStyle(.roundedBorder)
                     .help("Looks like wss://sofa.example.org. Both of you need the same one.")
@@ -69,8 +83,37 @@ struct SettingsView: View {
             } header: { Text("Advanced networking") }
         }
         .formStyle(.grouped)
-        .frame(width: 540, height: 720)
+        .frame(width: 540, height: 780)
         .padding(.vertical, 8)
+    }
+}
+
+/// How much the kept films take, and a button to remove them now.
+struct KeptFilmsRow: View {
+    @State private var bytes: Int64 = 0
+    @State private var cleared = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button("Remove kept films now") {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    FilmCache.shared.clear()
+                    let left = FilmCache.shared.totalBytes
+                    DispatchQueue.main.async { bytes = left; cleared = true }
+                }
+            }
+            .disabled(bytes == 0)
+            .accessibilityHint("Deletes the films kept for resuming, except one being watched right now")
+            Text(bytes == 0 ? (cleared ? "Removed." : "Nothing is kept at the moment.")
+                 : "\(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) kept at the moment.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .onAppear {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let now = FilmCache.shared.totalBytes
+                DispatchQueue.main.async { bytes = now }
+            }
+        }
     }
 }
 

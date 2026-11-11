@@ -39,6 +39,9 @@ final class AppSettings: ObservableObject {
     /// "automatic" or "off": in full screen, switch a fixed-rate display to a refresh rate that suits the film.
     @Published var displayMatch: String { didSet { defaults.set(displayMatch, forKey: "displayMatch") } }
 
+    /// How much disk space films kept for resuming may take, in GB (0: keep nothing).
+    @Published var keepFilmsGB: Double { didSet { defaults.set(keepFilmsGB, forKey: "keepFilmsGB") } }
+
     var echoSetting: EchoSetting { EchoSetting(rawValue: soundOutput) ?? .automatic }
 
     init() {
@@ -51,6 +54,7 @@ final class AppSettings: ObservableObject {
         systemSpatialAudio = defaults.bool(forKey: "systemSpatialAudio")
         matchFrameRate = defaults.object(forKey: "matchFrameRate") as? Bool ?? true
         displayMatch = defaults.string(forKey: "displayMatch") ?? "automatic"
+        keepFilmsGB = defaults.object(forKey: "keepFilmsGB") as? Double ?? Double(FilmCachePolicy.defaultCapacity >> 30)
         // A command-line override is handy for testing two copies on one Mac.
         if let override = LaunchOptions.shared.server { serverURL = override }
     }
@@ -99,6 +103,14 @@ struct LaunchOptions {
     var testConnectionOutput: String?
     /// Scripted runs never change the display's refresh rate unless this is given.
     var allowDisplayMatch = false
+    /// Host: open a room without a film.
+    var room = false
+    /// Things to do by themselves once the two are together (or, with `--script-alone`, once the room is
+    /// open), for tests and screenshots: "8:film=/path/a.mp4;20:close;25:film=/path/b.mkv;40:drop;50:leave".
+    /// Seconds count from that moment. Actions: film=<path>, close, play, pause, seek=<seconds>, drop,
+    /// camera=on|off, mic=on|off, leave.
+    var script: [(after: Double, action: String, argument: String)] = []
+    var scriptAlone = false
 
     init() {
         var args = ArraySlice(CommandLine.arguments.dropFirst())
@@ -120,6 +132,15 @@ struct LaunchOptions {
             case "--type-test-output": typeTestOutput = args.popFirst().map { URL(fileURLWithPath: $0) }
             case "--allow-display-match": allowDisplayMatch = true
             case "--test-connection": testConnectionOutput = args.popFirst()
+            case "--room": room = true
+            case "--script-alone": scriptAlone = true
+            case "--script":
+                for step in (args.popFirst() ?? "").split(separator: ";") {
+                    let parts = step.split(separator: ":", maxSplits: 1)
+                    guard parts.count == 2, let after = Double(parts[0]) else { continue }
+                    let action = parts[1].split(separator: "=", maxSplits: 1)
+                    script.append((after, String(action[0]), action.count > 1 ? String(action[1]) : ""))
+                }
             default: break
             }
         }
@@ -142,6 +163,19 @@ final class AppModel: ObservableObject {
 
     /// The host's Mac is checking the film it was given (ffprobe), before the room opens.
     @Published var inspecting = false
+    private var sweepTimer: Timer?
+
+    private func observeSettings() {
+        // The headphones setting applies straight away, also in the middle of a film.
+        settings.$soundOutput.sink { [weak self] value in
+            self?.party?.hub.echoSetting = EchoSetting(rawValue: value) ?? .automatic
+        }.store(in: &cancellables)
+        // So does the limit for kept films.
+        settings.$keepFilmsGB.sink { value in
+            FilmCache.shared.capacity = Int64(max(0, value) * Double(1 << 30))
+            DispatchQueue.global(qos: .utility).async { FilmCache.shared.sweep() }
+        }.store(in: &cancellables)
+    }
 
     init() {
         // Converted films from a session that didn't end cleanly.
@@ -151,10 +185,12 @@ final class AppModel: ObservableObject {
             self?.party?.leave()
             FilmPreparer.removeLeftovers()
         }
-        // The headphones setting applies straight away, also in the middle of a film.
-        settings.$soundOutput.sink { [weak self] value in
-            self?.party?.hub.echoSetting = EchoSetting(rawValue: value) ?? .automatic
-        }.store(in: &cancellables)
+        observeSettings()
+        // Films kept for resuming: remove what is too old now and every hour.
+        DispatchQueue.global(qos: .utility).async { FilmCache.shared.sweep() }
+        sweepTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in
+            DispatchQueue.global(qos: .utility).async { FilmCache.shared.sweep() }
+        }
         DisplayMatcher.shared.start(model: self)
         DispatchQueue.main.async { self.runLaunchOptions() }
     }
@@ -165,7 +201,7 @@ final class AppModel: ObservableObject {
                                  "flv", "wmv", "asf", "mpg", "mpeg", "vob", "ogv", "ogm", "3gp", "3g2", "rm", "rmvb"]
 
     private func runLaunchOptions() {
-        if let film = options.hostFilm { startHosting(film: film) }
+        if let film = options.hostFilm { startHosting(film: film) } else if options.room { startRoom() }
         if let code = options.joinCode { join(code: code) }
         if options.screen == "join" { screen = .join }
         if let text = options.typeTest { runTypeTest(text) }
@@ -184,15 +220,66 @@ final class AppModel: ObservableObject {
         return party
     }
 
-    func chooseFilmAndHost() {
+    // MARK: Choosing a film
+
+    /// A film can be chosen now: on the first screen (it opens a room with
+    /// it), or by the host of a room (it replaces the film; the call goes on).
+    var canChooseFilm: Bool {
+        switch screen {
+        case .welcome: return !inspecting
+        case .join: return false
+        case .party: return party?.canChangeFilm ?? false
+        }
+    }
+
+    var canCloseFilm: Bool {
+        guard screen == .party, let party else { return false }
+        return party.canChangeFilm && party.hasFilmActivity
+    }
+
+    /// The button, File ▸ Open… and ⌘O: shows the file panel, then `openFilm`.
+    func chooseFilm() {
+        guard canChooseFilm else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose a film to watch together"
         panel.prompt = "Watch this"
         let extra = Self.filmExtensions.compactMap { UTType(filenameExtension: $0, conformingTo: .movie) }
         panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie, .audiovisualContent] + extra
         panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        startHosting(film: url)
+        // Not modal: the call and the film go on while the panel is open.
+        let done: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.openFilm(url)
+        }
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow { panel.beginSheetModal(for: window, completionHandler: done) } else { panel.begin(completionHandler: done) }
+    }
+
+    /// A film was picked or dropped on the window.
+    func openFilm(_ url: URL) {
+        guard canChooseFilm else { return }
+        if screen == .party, let party {
+            // In a room: the film changes, nothing else does.
+            party.changeFilm(to: url)
+        } else {
+            startHosting(film: url)
+        }
+    }
+
+    func closeFilm() {
+        guard canCloseFilm else { return }
+        party?.closeFilm()
+    }
+
+    /// "Start a room": no film; the two see and hear each other, and a film can be chosen later.
+    func startRoom() {
+        guard let ps = partySettings() else { return }
+        notice = nil
+        Task { @MainActor in
+            await Self.requestPermissions(synthetic: options.synthetic)
+            let party = Party(role: .host, settings: ps)
+            party.openRoom()
+            self.attach(party)
+        }
     }
 
     func startHosting(film: URL) {
@@ -238,6 +325,7 @@ final class AppModel: ObservableObject {
     private func attach(_ party: Party) {
         self.party = party
         screen = .party
+        var scriptStarted = false
         party.$phase.sink { [weak self] phase in
             guard let self else { return }
             if case .waitingForPartner(let code) = phase, let file = self.options.codeFile {
@@ -249,6 +337,12 @@ final class AppModel: ObservableObject {
             if phase == .together, self.options.autoPlay, party.role == .host {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4) { party.playback.play() }
             }
+            var begin = phase == .together
+            if case .waitingForPartner = phase, self.options.scriptAlone { begin = true }
+            if begin, !scriptStarted {
+                scriptStarted = true
+                self.runScript(on: party)
+            }
         }.store(in: &cancellables)
         if options.subtitles {
             party.playback.$hasSubtitles.filter { $0 }.first().receive(on: DispatchQueue.main)
@@ -258,10 +352,33 @@ final class AppModel: ObservableObject {
         party.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &cancellables)
     }
 
+    /// Tests and screenshots: the steps of `--script`, each at its time.
+    private func runScript(on party: Party) {
+        for step in options.script {
+            DispatchQueue.main.asyncAfter(deadline: .now() + step.after) { [weak self, weak party] in
+                guard let self, let party, party === self.party else { return }
+                switch step.action {
+                // Straight to the party, so that a refusal (an older partner) is on record in its log.
+                case "film": party.changeFilm(to: URL(fileURLWithPath: step.argument))
+                case "close": party.closeFilm()
+                case "play": party.playback.play()
+                case "pause": party.playback.pause()
+                case "seek": party.playback.seek(to: Double(step.argument) ?? 0)
+                case "drop": party.dropConnectionForTesting()
+                case "camera": party.cameraOn = step.argument != "off"
+                case "mic": party.micOn = step.argument != "off"
+                case "leave": self.leaveParty()
+                default: break
+                }
+            }
+        }
+    }
+
     func leaveParty() {
         party?.leave()
         party = nil
         cancellables.removeAll()
+        observeSettings()
         screen = .welcome
         if let window = NSApp.keyWindow, window.styleMask.contains(.fullScreen) { window.toggleFullScreen(nil) }
     }
@@ -272,6 +389,7 @@ final class AppModel: ObservableObject {
         party?.leave()
         party = nil
         cancellables.removeAll()
+        observeSettings()
         notice = message.isEmpty ? nil : message
         screen = retryJoin ? .join : .welcome
     }

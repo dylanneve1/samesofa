@@ -21,32 +21,45 @@ struct PartyView: View {
     @State private var keyMonitor: Any?
     @State private var lastPointer: CGPoint?
 
+    /// The film has the window: it is loaded and can be shown. Until then (no
+    /// film, one being chosen, prepared or fetched) the call has it.
+    private var filmOnScreen: Bool { party.sharedFilm != nil && playback.isLoaded }
+    private var together: Bool { party.phase == .together }
+
     var body: some View {
         GeometryReader { geo in
             ZStack {
                 Color.black
                 PlayerSurface(player: playback.player, frameRate: playback.frameRate,
                               playing: playback.intendsToPlay && !playback.isHeld, matchFrameRate: settings.matchFrameRate)
-                    .opacity(playback.isLoaded ? 1 : 0)
+                    .opacity(filmOnScreen ? 1 : 0)
+                    .allowsHitTesting(filmOnScreen)
                     .onTapGesture(count: 2) { toggleFullScreen() }
                     .onTapGesture { if party.phase == .together { playback.togglePlay() } }
 
+                if together && !filmOnScreen {
+                    // Just the two of you: your partner has the window.
+                    HangoutView(party: party, playback: playback, hadFilm: hadFilm) { model.chooseFilm() } closeFilm: { model.closeFilm() }
+                        .transition(.opacity)
+                }
+
                 centerOverlay
 
-                if party.phase == .together || party.remoteVideoTrack != nil {
+                if filmOnScreen, party.phase == .together || party.remoteVideoTrack != nil {
                     bubble(in: geo.size)
                 }
 
                 VStack(spacing: 0) {
                     topBar
                     Spacer()
-                    controlBar
+                    if filmOnScreen { controlBar }
                 }
                 .opacity(showChrome ? 1 : 0)
                 .animation(.easeInOut(duration: 0.3), value: showChrome)
 
                 CursorHider(hidden: !showChrome).frame(width: 0, height: 0)
             }
+            .animation(.easeInOut(duration: 0.35), value: filmOnScreen)
             .onContinuousHover { phase in
                 // Only real pointer movement counts; SwiftUI also reports hover on re-render.
                 if case .active(let point) = phase {
@@ -57,11 +70,19 @@ struct PartyView: View {
             }
         }
         .ignoresSafeArea()
+        // The host drops another film on the window: it replaces the film, the call goes on.
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            guard model.canChooseFilm, let provider = providers.first else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                if let url { DispatchQueue.main.async { model.openFilm(url) } }
+            }
+            return true
+        }
         .task {
             // Auto-hide the controls during playback after 3 s without mouse movement.
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(500))
-                if controlsVisible, playback.intendsToPlay, !playback.isHeld,
+                if controlsVisible, filmOnScreen, playback.intendsToPlay, !playback.isHeld,
                    Date().timeIntervalSince(lastActivity) > 3, scrubbing == nil {
                     controlsVisible = false
                 }
@@ -70,11 +91,23 @@ struct PartyView: View {
         .onChange(of: party.phase) { _, phase in
             if case .ended(let message) = phase { model.handleEnded(message) }
         }
-        .onAppear { installKeys() }
+        .onChange(of: party.sharedFilm != nil) { _, has in
+            if has { hadFilm = true }
+            // A new film (or none): the controls are there again.
+            controlsVisible = true
+            lastActivity = Date()
+        }
+        .onAppear {
+            if party.sharedFilm != nil { hadFilm = true }
+            installKeys()
+        }
         .onDisappear { removeKeys() }
     }
 
-    private var showChrome: Bool { controlsVisible || !playback.intendsToPlay || showQuality }
+    /// A film has been on in this room already (the next one is "another film").
+    @State private var hadFilm = false
+
+    private var showChrome: Bool { !filmOnScreen || controlsVisible || !playback.intendsToPlay || showQuality }
 
     private func poke() {
         lastActivity = Date()
@@ -93,8 +126,10 @@ struct PartyView: View {
         case .waitingForPartner(let code):
             // While the host watches alone, the picture stays clear: the code
             // moves to a chip in the top bar and the card returns on pause.
-            if !playback.intendsToPlay || party.preparing != nil {
-                WaitingForPartnerCard(code: code, filmName: party.filmName, preparing: party.preparing) { model.leaveParty() }
+            if !filmOnScreen || !playback.intendsToPlay {
+                WaitingForPartnerCard(code: code, hasFilm: party.sharedFilm != nil, choosing: party.choosingFilm,
+                                      preparing: party.preparing, notice: party.filmNotice,
+                                      chooseFilm: { model.chooseFilm() }, cancel: { model.closeFilm() })
             }
         case .connecting:
             StatusCard {
@@ -113,47 +148,36 @@ struct PartyView: View {
                 }
             }
         case .together where party.reconnecting:
+            let hasFilm = party.sharedFilm != nil
             StatusCard {
                 if party.connectionFailed {
                     Text("Couldn't reconnect").font(.title2)
-                    Text("Check the internet connection on both Macs, then try again. The film stays where it was, and what has already arrived is kept.")
-                        .multilineTextAlignment(.center).frame(maxWidth: 380)
+                    Text(hasFilm ? "Check the internet connection on both Macs, then try again. The film stays where it was, and what has already arrived is kept."
+                         : "Check the internet connection on both Macs, then try again.")
+                        .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true).frame(maxWidth: 380)
                 } else {
                     ProgressView().controlSize(.large).accessibilityHidden(true)
                     Text("Connection lost").font(.title2)
-                    Text("Trying to reconnect… The film waits, and what has already arrived is kept.")
-                        .multilineTextAlignment(.center).frame(maxWidth: 380)
+                    Text(hasFilm ? "Trying to reconnect… The film waits, and what has already arrived is kept." : "Trying to reconnect…")
+                        .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true).frame(maxWidth: 380)
                 }
                 HStack(spacing: 12) {
-                    Button("Leave") { model.leaveParty() }
-                    Button("Try again") { party.retryConnection() }.buttonStyle(.borderedProminent)
+                    Button { model.leaveParty() } label: { Text("Leave").frame(width: 110, height: 36) }
+                        .buttonStyle(SoftButtonStyle())
+                    Button { party.retryConnection() } label: { Text("Try again").fontWeight(.semibold).frame(width: 130, height: 36) }
+                        .buttonStyle(AccentButtonStyle())
                         .accessibilityHint("Connects again in the same room")
                 }
+                .padding(.top, 4)
             }
-        case .together:
-            if party.role == .host, let preparing = party.preparing {
-                StatusCard {
-                    PreparingView(preparing: preparing) { model.leaveParty() }
-                }
-            } else if party.role == .guest && !playback.isLoaded, let preparing = party.preparing {
-                StatusCard {
-                    Text("Your partner's Mac is preparing the film").font(.title2)
-                    ProgressView(value: preparing.fraction).frame(width: 260).tint(Theme.accent)
-                    Text("\(Int(preparing.fraction * 100))%").font(.callout.monospacedDigit()).foregroundStyle(Theme.secondaryText)
-                }
-            } else if party.role == .guest && !playback.isLoaded {
-                StatusCard {
-                    Text("Getting the film ready").font(.title2)
-                    ProgressView(value: party.transferFraction).frame(width: 260).tint(Theme.accent)
-                    if !party.transferLine.isEmpty { Text(party.transferLine).font(.callout).foregroundStyle(.secondary) }
-                }
-            } else if playback.isHeld {
+        case .together where filmOnScreen:
+            if playback.isHeld {
                 StatusCard {
                     ProgressView()
                     Text(playback.localBuffering ? "Catching up — the film is still arriving…" : "Waiting for your partner to catch up…")
                         .font(.title3)
                 }
-            } else if !playback.intendsToPlay && playback.position < 0.5 && playback.isLoaded {
+            } else if !playback.intendsToPlay && playback.position < 0.5 {
                 Button { playback.play() } label: {
                     Label("Play together", systemImage: "play.fill")
                         .font(.system(size: 22, weight: .semibold, design: .rounded))
@@ -171,36 +195,61 @@ struct PartyView: View {
 
     private var topBar: some View {
         HStack(spacing: 12) {
+            // The only thing that ends the call. Closing or changing the film does not.
             Button { model.leaveParty() } label: {
-                Image(systemName: "xmark").font(.system(size: 15, weight: .bold)).frame(width: 36, height: 36)
+                HStack(spacing: 7) {
+                    Image(systemName: "rectangle.portrait.and.arrow.right").font(.system(size: 13, weight: .semibold))
+                    Text("Leave").font(.system(size: 14, weight: .semibold))
+                }
+                .padding(.horizontal, 14).frame(height: 36)
             }
-            .buttonStyle(CircleButtonStyle())
-            .help("Leave")
+            .buttonStyle(PillButtonStyle())
+            .help(party.role == .host ? "Leave and close the room" : "Leave the room")
             .accessibilityLabel("Leave")
-            Text(party.filmName ?? "")
-                .font(.system(size: 15, weight: .semibold))
-                .lineLimit(1)
-                .shadow(radius: 4)
+            .accessibilityHint(party.role == .host ? "Ends the call and closes the room" : "Ends the call")
+            if filmOnScreen {
+                Text(party.filmName ?? "")
+                    .font(.system(size: 15, weight: .semibold))
+                    .lineLimit(1)
+                    .shadow(radius: 4)
+                    .padding(.leading, 4)
+                if party.role == .host {
+                    Button { model.chooseFilm() } label: {
+                        Label("Change film", systemImage: "film.stack").font(.system(size: 13, weight: .medium))
+                            .padding(.horizontal, 12).frame(height: 32)
+                    }
+                    .buttonStyle(PillButtonStyle())
+                    .disabled(!party.canChangeFilm)
+                    .help(party.canChangeFilm ? "Watch another film. The call goes on. (⌘O)" : "Your partner needs SameSofa 1.3 for changing film")
+                    Button { model.closeFilm() } label: {
+                        Label("Close film", systemImage: "xmark").font(.system(size: 13, weight: .medium))
+                            .padding(.horizontal, 12).frame(height: 32)
+                    }
+                    .buttonStyle(PillButtonStyle())
+                    .disabled(!party.canChangeFilm)
+                    .help(party.canChangeFilm ? "Stop watching this film. The call goes on. (⇧⌘W)" : "Your partner needs SameSofa 1.3 for closing the film")
+                }
+            }
             Spacer()
-            if case .waitingForPartner(let code) = party.phase { CodeChip(code: code) }
+            if case .waitingForPartner(let code) = party.phase, filmOnScreen { CodeChip(code: code) }
             if party.phase == .together, let note = party.versionNote, !versionNoteDismissed {
                 // Not in the way of anything: a line in the top bar that goes away on a click.
                 Button { versionNoteDismissed = true } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.circle").accessibilityHidden(true)
-                        Text(note).lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.circle").padding(.top, 1).accessibilityHidden(true)
+                        Text(note).lineLimit(3).multilineTextAlignment(.leading).fixedSize(horizontal: false, vertical: true)
                     }
-                    .font(.callout).padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(Capsule().fill(.black.opacity(0.45)))
-                    .overlay(Capsule().stroke(.white.opacity(0.12)))
+                    .font(.callout).padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.black.opacity(0.55)))
+                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(.white.opacity(0.14)))
                 }
                 .buttonStyle(.plain)
-                .frame(maxWidth: 420)
+                .frame(maxWidth: 400)
                 .help("Click to hide this note")
                 .accessibilityLabel(note)
                 .accessibilityHint("Hides this note")
             }
-            if party.phase == .together, party.preparing == nil, party.transferFraction < 1, let film = party.sharedFilm {
+            if filmOnScreen, party.phase == .together, party.transferFraction < 1, let film = party.sharedFilm {
                 Text(party.transferLine.isEmpty ? TransferText.line(sending: party.role == .host, received: 0, total: film.size, rate: 0) : party.transferLine)
                     .font(.callout).foregroundStyle(.white.opacity(0.75))
                     .padding(.horizontal, 12).padding(.vertical, 6)
@@ -208,13 +257,14 @@ struct PartyView: View {
             }
         }
         .padding(.top, 30).padding(.horizontal, 22).padding(.bottom, 40)
-        .background(LinearGradient(colors: [.black.opacity(0.65), .clear], startPoint: .top, endPoint: .bottom))
+        .background(LinearGradient(colors: [.black.opacity(filmOnScreen ? 0.65 : 0), .clear], startPoint: .top, endPoint: .bottom))
+        .onChange(of: party.versionNote) { _, _ in versionNoteDismissed = false }
     }
 
     // MARK: Bottom controls
 
     private var controlBar: some View {
-        let enabled = (party.phase == .together || party.role == .host) && party.preparing == nil && playback.isLoaded
+        let enabled = (party.phase == .together || party.role == .host) && filmOnScreen
         return VStack(spacing: 10) {
             ScrubBar(position: scrubbing ?? playback.position, duration: playback.duration,
                      available: party.role == .guest ? party.transferFraction : 1,
@@ -321,10 +371,13 @@ struct PartyView: View {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             // Leave typing in text fields alone.
             if NSApp.keyWindow?.firstResponder is NSTextView { return event }
+            // Shortcuts with Command (⌘O, ⇧⌘W, ...) belong to the menus.
+            if event.modifierFlags.contains(.command) { return event }
+            let film = party.sharedFilm != nil && playback.isLoaded
             switch event.keyCode {
-            case 49: playback.togglePlay(); poke(); return nil            // space
-            case 123: playback.skip(by: -10); poke(); return nil          // left
-            case 124: playback.skip(by: 10); poke(); return nil           // right
+            case 49: if film { playback.togglePlay(); poke(); return nil }; return event   // space
+            case 123: if film { playback.skip(by: -10); poke(); return nil }; return event // left
+            case 124: if film { playback.skip(by: 10); poke(); return nil }; return event  // right
             case 3: toggleFullScreen(); return nil                        // F
             case 46: party.micOn.toggle(); poke(); return nil             // M
             case 53:                                                      // esc
@@ -441,8 +494,14 @@ struct PreparingView: View {
 
 struct WaitingForPartnerCard: View {
     let code: String
-    let filmName: String?
+    /// A film is loaded already (the host can watch while waiting).
+    var hasFilm = false
+    /// The film that was picked is being looked at.
+    var choosing = false
     var preparing: Preparing?
+    /// Why the film that was picked can't be watched.
+    var notice: String?
+    var chooseFilm: () -> Void = {}
     var cancel: () -> Void = {}
     @State private var copied = false
 
@@ -466,14 +525,30 @@ struct WaitingForPartnerCard: View {
                     .frame(width: 150, height: 36)
             }
             .buttonStyle(SoftButtonStyle())
-            Label("Waiting for your partner. You can start watching meanwhile.", systemImage: "person.2")
+            Label(hasFilm ? "Waiting for your partner. You can start watching meanwhile."
+                  : "Waiting for your partner. You don't need a film to start: choose one now or later.", systemImage: "person.2")
                 .foregroundStyle(Theme.secondaryText)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
             if let preparing {
                 Divider().overlay(Color.white.opacity(0.15)).frame(width: 300)
                 PreparingView(preparing: preparing, cancel: cancel)
+            } else if choosing {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small).accessibilityHidden(true)
+                    Text("Looking at the film…").foregroundStyle(Theme.secondaryText)
+                }
+            } else if !hasFilm {
+                if let notice { NoticeView(text: notice) }
+                Button(action: chooseFilm) {
+                    Label("Choose a film", systemImage: "film.stack").fontWeight(.semibold).frame(width: 200, height: 42)
+                }
+                .buttonStyle(AccentButtonStyle())
+                .accessibilityHint("Picks a film on this Mac to watch together")
             }
         }
         .padding(.horizontal, 54).padding(.vertical, 40)
+        .frame(maxWidth: 640)
         .background(RoundedRectangle(cornerRadius: 30, style: .continuous).fill(.ultraThinMaterial))
         .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous).stroke(Theme.cardBorder))
         .shadow(color: .black.opacity(0.5), radius: 40)
@@ -502,17 +577,32 @@ struct CircleButtonStyle: ButtonStyle {
     }
 }
 
+/// A labelled button on the film or on the dark window: a soft pill.
+struct PillButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
+    @State private var hovering = false
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.white.opacity(enabled ? 1 : 0.4))
+            .background(Capsule().fill(Color.white.opacity(configuration.isPressed ? 0.28 : (hovering && enabled ? 0.22 : 0.13))))
+            .overlay(Capsule().stroke(.white.opacity(0.1)))
+            .contentShape(Capsule())
+            .onHover { hovering = $0 }
+    }
+}
+
 struct ToggleButton: View {
     let on: Bool
     let onIcon: String
     let offIcon: String
     let help: String
+    var size: CGFloat = 38
     let action: () -> Void
     var body: some View {
         Button(action: action) {
             Image(systemName: on ? onIcon : offIcon)
-                .font(.system(size: 16))
-                .frame(width: 38, height: 38)
+                .font(.system(size: size * 0.42))
+                .frame(width: size, height: size)
                 .foregroundStyle(on ? .white : Color.black.opacity(0.85))
                 .background(Circle().fill(on ? Color.white.opacity(0.12) : Color.white.opacity(0.85)))
         }
@@ -565,9 +655,9 @@ struct QualityView: View {
     @AppStorage("displayMatch") private var displayMatch = "automatic"
     @ObservedObject private var displayMatcher = DisplayMatcher.shared
 
-    private var displayLine: (String, String) {
+    private var displayLine: (String, String, String?) {
         let line = displayMatcher.readout(filmFrameRate: playback.frameRate, settingOn: displayMatch != "off")
-        return (line.title, line.detail)
+        return (line.title, line.detail, line.note)
     }
 
     var body: some View {
@@ -599,6 +689,13 @@ struct QualityView: View {
                 }
             }
             row("Display", display.0, display.1)
+            if let note = display.2 {
+                // A switch of the display was tried and undone: said in one line, where it can be seen.
+                Label(note, systemImage: "arrow.uturn.backward.circle")
+                    .font(.caption).foregroundStyle(Theme.accent)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel(note)
+            }
         }
         .padding(18)
         .frame(width: 430, alignment: .leading)

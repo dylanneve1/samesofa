@@ -18,7 +18,15 @@ struct SameSofaApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1180, height: 720)
         .commands {
-            CommandGroup(replacing: .newItem) {}
+            CommandGroup(replacing: .newItem) {
+                // On the first screen: host this film. In a room (host): watch this film instead; the call goes on.
+                Button("Open…") { model.chooseFilm() }
+                    .keyboardShortcut("o", modifiers: .command)
+                    .disabled(!model.canChooseFilm)
+                Button("Close Film") { model.closeFilm() }
+                    .keyboardShortcut("w", modifiers: [.command, .shift])
+                    .disabled(!model.canCloseFilm)
+            }
             CommandGroup(replacing: .appInfo) { InfoMenuItems() }
             CommandGroup(replacing: .help) { ShortcutsMenuItem() }
         }
@@ -90,6 +98,7 @@ extension LaunchOptions {
     /// Started by a script or test (command-line switches), not by a person.
     var isScripted: Bool {
         server != nil || hostFilm != nil || joinCode != nil || synthetic || screen != nil || typeTest != nil || show != nil || testConnectionOutput != nil
+            || room || !script.isEmpty
     }
 }
 
