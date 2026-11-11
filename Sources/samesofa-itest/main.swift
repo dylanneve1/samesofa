@@ -33,6 +33,7 @@ if args["audio-check"] != nil {
     exit(0)
 }
 // The call's audio threads and the microphone converter, without any hardware.
+if args["device-smoke"] != nil { DeviceSmoke.run(args) }
 if args["audio-thread-test"] != nil { AudioThreadTests.runThreadTest() }
 if let film = args["audio-engine-test"] {
     AudioThreadTests.runEngineTest(film: film.isEmpty ? nil : URL(fileURLWithPath: film), realSwitch: args["real-output-switch"] != nil)

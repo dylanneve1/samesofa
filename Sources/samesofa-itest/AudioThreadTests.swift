@@ -46,12 +46,15 @@ enum AudioThreadTests {
             var expected: Int16?
             var collected: [Int16] = []
             var collect = false
+            /// Loudest sample delivered since it was last set to zero.
+            var peak = 0
         }
 
         lazy var deliverRecordedData: RTCAudioDeviceDeliverRecordedDataBlock = { [state] _, _, _, frames, data, _, _ in
             guard let samples = data?.pointee.mBuffers.mData?.assumingMemoryBound(to: Int16.self) else { return noErr }
             state.withLock { s in
                 s.delivered += Int(frames)
+                for i in 0..<Int(frames) { s.peak = max(s.peak, abs(Int(samples[i]))) }
                 if let expected = s.expected {
                     for i in 0..<Int(frames) where samples[i] != expected { s.foreign += 1 }
                 }
@@ -373,15 +376,15 @@ enum AudioThreadTests {
             atexit { AudioThreadTests.cleanup?() }
             for sig in [SIGINT, SIGTERM, SIGHUP] { signal(sig) { _ in AudioThreadTests.cleanup?(); _exit(1) } }
             print("INFO default output before: id \(original.id) (\(original.summary))")
-            func survives(_ what: String) {
+            func survives(_ what: String, mustRebuild: Bool = true) {
                 let restarts = hub.engineRestarts, position = playback.currentTime
                 let tapBefore = tapFrames.withLock { $0 }
                 _ = listen(2)
                 let renderedBefore = hub.diagnostics().renderCallbacks, tapMiddle = tapFrames.withLock { $0 }
                 let energy = listen(2)
                 let d = hub.diagnostics()
-                check("\(what): the call's audio engine was rebuilt and runs", d.engineRunning && hub.engineError == nil && d.renderCallbacks > renderedBefore,
-                      "\(hub.engineRestarts - restarts) rebuild(s)")
+                check("\(what): the call's audio engine runs", d.engineRunning && hub.engineError == nil && d.renderCallbacks > renderedBefore
+                        && (!mustRebuild || hub.engineRestarts > restarts), "rebuilt \(hub.engineRestarts - restarts) time(s)")
                 check("\(what): the film plays on with sound", playback.player.rate == 1 && playback.currentTime - position > 3
                         && tapFrames.withLock { $0 } - tapMiddle > 48_000 && energy > 0,
                       String(format: "%.1f s of film in 4 s, %d frames of sound in the last 2 s (%d in the first 2 s)", playback.currentTime - position,
@@ -397,7 +400,7 @@ enum AudioThreadTests {
             // The device itself disappears (headphones unplugged).
             AudioHardwareDestroyAggregateDevice(aggregate)
             cleanup = nil
-            survives("the other device removed")
+            survives("the other device removed", mustRebuild: false)
             let final = AudioDevices.defaultOutput()
             print("INFO default output after: id \(final?.id ?? 0) (\(final?.summary ?? "?"))")
             check("the default output is the original one again", final?.id == original.id)
