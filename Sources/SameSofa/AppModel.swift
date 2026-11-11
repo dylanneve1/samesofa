@@ -15,6 +15,15 @@ final class AppSettings: ObservableObject {
         (Bundle.main.object(forInfoDictionaryKey: "SameSofaDefaultServerURL") as? String).flatMap { $0.isEmpty ? nil : $0 } ?? placeholderServer
     }
 
+    /// A TURN relay baked in at build time by scripts/build.sh (SAMESOFA_TURN_URL,
+    /// SAMESOFA_TURN_USERNAME, SAMESOFA_TURN_CREDENTIAL), if any. Used while the
+    /// TURN server field in Settings is empty; never shown there.
+    static var builtInRelay: (url: String, username: String, credential: String)? {
+        func value(_ key: String) -> String { (Bundle.main.object(forInfoDictionaryKey: key) as? String) ?? "" }
+        let url = value("SameSofaDefaultTurnURL")
+        return url.isEmpty ? nil : (url, value("SameSofaDefaultTurnUsername"), value("SameSofaDefaultTurnCredential"))
+    }
+
     private let defaults = UserDefaults.standard
     @Published var serverURL: String { didSet { defaults.set(serverURL, forKey: "serverURL") } }
     @Published var stunURLs: String { didSet { defaults.set(stunURLs, forKey: "stunURLs") } }
@@ -51,9 +60,13 @@ final class AppSettings: ObservableObject {
         return !serverURL.contains("CHANGE-ME")
     }
 
+    /// The user's own relay if the TURN server field is filled in, else the built-in one, else none.
     var ice: IceSettings {
-        IceSettings(stunURLs: stunURLs.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) },
-                    turnURL: turnURL, turnUsername: turnUsername, turnCredential: turnCredential)
+        let stun = stunURLs.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        if turnURL.trimmingCharacters(in: .whitespaces).isEmpty, let relay = Self.builtInRelay {
+            return IceSettings(stunURLs: stun, turnURL: relay.url, turnUsername: relay.username, turnCredential: relay.credential)
+        }
+        return IceSettings(stunURLs: stun, turnURL: turnURL, turnUsername: turnUsername, turnCredential: turnCredential)
     }
 }
 
@@ -82,6 +95,8 @@ struct LaunchOptions {
     /// window (not the system), and record what code the app tried to join.
     var typeTest: String?
     var typeTestOutput: URL?
+    /// Screenshots only: with `--show settings`, press "Test connection" by itself; the result is also written to this file.
+    var testConnectionOutput: String?
     /// Scripted runs never change the display's refresh rate unless this is given.
     var allowDisplayMatch = false
 
@@ -104,6 +119,7 @@ struct LaunchOptions {
             case "--type-test": typeTest = args.popFirst()
             case "--type-test-output": typeTestOutput = args.popFirst().map { URL(fileURLWithPath: $0) }
             case "--allow-display-match": allowDisplayMatch = true
+            case "--test-connection": testConnectionOutput = args.popFirst()
             default: break
             }
         }

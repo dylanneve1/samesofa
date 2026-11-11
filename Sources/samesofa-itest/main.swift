@@ -34,6 +34,7 @@ if args["audio-check"] != nil {
 }
 // The call's audio threads and the microphone converter, without any hardware.
 if args["device-smoke"] != nil { DeviceSmoke.run(args) }
+if let server = args["connection-test"] { ConnectionTest.run(server: server) }
 if args["display-mode-test"] != nil { DisplayModeTest.run(switchForReal: args["switch"] != nil) }
 if args["audio-thread-test"] != nil { AudioThreadTests.runThreadTest() }
 if let film = args["audio-engine-test"] {

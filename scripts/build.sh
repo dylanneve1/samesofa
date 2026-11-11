@@ -4,6 +4,12 @@
 #   scripts/build.sh                         # placeholder server address
 #   SAMESOFA_SERVER_URL=wss://sofa.example.org scripts/build.sh   # bake in your server
 #   SAMESOFA_PROJECT_URL=https://example.org/samesofa ...          # "Source code" link in the About box
+#   SAMESOFA_TURN_URL=turn:turn.example.org:3478 SAMESOFA_TURN_USERNAME=... SAMESOFA_TURN_CREDENTIAL=... scripts/build.sh
+#                                            # bake in a TURN relay as the default (Settings still overrides it)
+#
+# Whatever is baked in ends up readable inside the app: only bake in a relay
+# account you are happy to hand to everyone who gets this copy. The values are
+# never printed by this script and never belong in the repository.
 #
 # Signing: uses SAMESOFA_SIGN_IDENTITY if set (e.g. "Developer ID Application: ..."),
 # with the hardened runtime. Otherwise the app is ad-hoc signed. Never notarizes.
@@ -15,6 +21,11 @@ BUILD_NUMBER=${SAMESOFA_BUILD_NUMBER:-1}
 SERVER_URL=${SAMESOFA_SERVER_URL:-}
 # Where the source code lives, for the About box (optional).
 PROJECT_URL=${SAMESOFA_PROJECT_URL:-}
+# A TURN relay used while the TURN field in Settings is empty (optional):
+# SAMESOFA_TURN_URL, SAMESOFA_TURN_USERNAME, SAMESOFA_TURN_CREDENTIAL. They
+# are only read further down, where tracing is off.
+# Text for a <string> in the Info.plist.
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 ARCHS=${SAMESOFA_ARCHS:-"arm64 x86_64"}
 export DEVELOPER_DIR=${DEVELOPER_DIR:-$(xcode-select -p)}
 
@@ -53,6 +64,20 @@ if [ "${SAMESOFA_NO_FFMPEG:-}" != 1 ]; then
   cp Vendor/FFmpeg/BUILDINFO.txt Vendor/FFmpeg/COPYING.LGPLv2.1 Vendor/FFmpeg/COPYING.dav1d "$APP/Contents/Resources/FFmpeg/"
 fi
 
+# From here to the end of the Info.plist nothing is traced, so that the relay
+# credential does not show up in a log even under "sh -x".
+case $- in *x*) TRACING=1; set +x ;; *) TRACING= ;; esac
+HAS_RELAY=
+if [ -n "${SAMESOFA_TURN_URL:-}" ]; then HAS_RELAY=1; fi
+if [ -z "$HAS_RELAY" ] && [ -n "${SAMESOFA_TURN_USERNAME:-}${SAMESOFA_TURN_CREDENTIAL:-}" ]; then
+  echo "SAMESOFA_TURN_USERNAME / SAMESOFA_TURN_CREDENTIAL are set but SAMESOFA_TURN_URL is not." >&2
+  exit 1
+fi
+SERVER_URL_XML=$(xml_escape "$SERVER_URL")
+PROJECT_URL_XML=$(xml_escape "$PROJECT_URL")
+TURN_URL_XML=$(xml_escape "${SAMESOFA_TURN_URL:-}")
+TURN_USERNAME_XML=$(xml_escape "${SAMESOFA_TURN_USERNAME:-}")
+TURN_CREDENTIAL_XML=$(xml_escape "${SAMESOFA_TURN_CREDENTIAL:-}")
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -74,11 +99,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>NSHumanReadableCopyright</key><string>Copyright © 2026 SameSofa contributors. MIT-0 licence. Provided as is, without warranty.</string>
 	<key>NSCameraUsageDescription</key><string>SameSofa shows your face to your partner in a little bubble while you watch.</string>
 	<key>NSMicrophoneUsageDescription</key><string>SameSofa lets you talk to your partner while you watch.</string>
-	<key>SameSofaDefaultServerURL</key><string>$SERVER_URL</string>
-	<key>SameSofaProjectURL</key><string>$PROJECT_URL</string>
+	<key>SameSofaDefaultServerURL</key><string>$SERVER_URL_XML</string>
+	<key>SameSofaProjectURL</key><string>$PROJECT_URL_XML</string>
+	<key>SameSofaDefaultTurnURL</key><string>$TURN_URL_XML</string>
+	<key>SameSofaDefaultTurnUsername</key><string>$TURN_USERNAME_XML</string>
+	<key>SameSofaDefaultTurnCredential</key><string>$TURN_CREDENTIAL_XML</string>
 </dict>
 </plist>
 PLIST
+unset TURN_URL_XML TURN_USERNAME_XML TURN_CREDENTIAL_XML SAMESOFA_TURN_URL SAMESOFA_TURN_USERNAME SAMESOFA_TURN_CREDENTIAL
+if [ -n "$TRACING" ]; then set -x; fi
+plutil -lint "$APP/Contents/Info.plist" >/dev/null
+if [ -n "$HAS_RELAY" ]; then echo "TURN relay: baked in as the default (address, username and credential are not shown)"; fi
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 IDENTITY=${SAMESOFA_SIGN_IDENTITY:-}

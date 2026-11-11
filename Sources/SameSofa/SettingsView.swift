@@ -1,3 +1,4 @@
+import SameSofaKit
 import SwiftUI
 
 struct SettingsView: View {
@@ -41,6 +42,7 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                 Text("The small room server that lets two copies of SameSofa find each other. Both of you need the same address. It never sees your film, voice or video.")
                     .font(.caption).foregroundStyle(.secondary)
+                ConnectionTestRow()
             } header: { Text("Connection") }
 
             Section {
@@ -52,12 +54,74 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                 SecureField("TURN password", text: $settings.turnCredential)
                     .textFieldStyle(.roundedBorder)
-                Text("Only needed if the two of you can't connect directly (some office, hotel or mobile networks). A TURN server relays the encrypted connection.")
+                Text("Only needed if the two of you can't connect directly (some office, hotel or mobile networks). A TURN server relays the encrypted connection."
+                     + (AppSettings.builtInRelay != nil ? " This copy of SameSofa comes with a relay; it is used while the TURN server field is empty." : ""))
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Advanced networking") }
         }
         .formStyle(.grouped)
         .frame(width: 540, height: 720)
         .padding(.vertical, 8)
+    }
+}
+
+/// "Test connection": the room server, and the TURN relay if there is one. One line each.
+struct ConnectionTestRow: View {
+    @EnvironmentObject var settings: AppSettings
+    @State private var running = false
+    @State private var result: ConnectionTester.Result?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Button("Test connection") { run() }
+                    .disabled(running)
+                    .accessibilityHint("Checks the room server and, if one is set, the TURN relay")
+                if running {
+                    ProgressView().controlSize(.small).accessibilityHidden(true)
+                    Text("Testing…").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if let result {
+                line(result.server)
+                if let relay = result.relay {
+                    line(relay)
+                } else {
+                    Text("Relay (TURN): none set. Most connections work without one.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .onAppear {
+            // Screenshot runs: press the button without a click.
+            if LaunchOptions.shared.testConnectionOutput != nil, result == nil, !running { run() }
+        }
+        // A changed address makes the old answer stale.
+        .onChange(of: settings.serverURL) { result = nil }
+        .onChange(of: settings.turnURL) { result = nil }
+    }
+
+    private func line(_ line: ConnectionTester.Line) -> some View {
+        Label {
+            Text(line.text).font(.caption).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        } icon: {
+            Image(systemName: line.ok ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                .foregroundStyle(line.ok ? Color.green : Color.orange)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel((line.ok ? "Passed. " : "Failed. ") + line.text)
+    }
+
+    private func run() {
+        running = true
+        result = nil
+        ConnectionTester.run(serverURL: settings.serverURL, ice: settings.ice) { outcome in
+            result = outcome
+            running = false
+            if let path = LaunchOptions.shared.testConnectionOutput {
+                let text = [outcome.server.text, outcome.relay?.text ?? "Relay (TURN): none set."].joined(separator: "\n")
+                try? text.write(toFile: path, atomically: true, encoding: .utf8)
+            }
+        }
     }
 }

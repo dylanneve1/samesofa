@@ -400,6 +400,17 @@ relay: run e.g. [coturn](https://github.com/coturn/coturn) and enter its
 `turn:` / `turns:` URL, username and password under *Settings ▸ Advanced
 networking* on both Macs.
 
+A relay can also be baked in, like the server address:
+`SAMESOFA_TURN_URL=turn:turn.example.org:3478 SAMESOFA_TURN_USERNAME=…
+SAMESOFA_TURN_CREDENTIAL=… scripts/build.sh`. It is used while the TURN field
+in Settings is empty; a relay entered there takes its place. Whatever is baked
+in can be read out of the app by anyone who has that copy, so use a relay
+account made for the purpose. The build script never prints these values.
+
+*Settings ▸ Connection ▸ Test connection* checks the room server and, if a
+relay is set (or baked in), that the relay hands out an allocation with those
+credentials. One line each, with what to do when it fails.
+
 ---
 
 ## Build from source
