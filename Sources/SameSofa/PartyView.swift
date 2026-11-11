@@ -97,8 +97,15 @@ struct PartyView: View {
             }
         case .connecting:
             StatusCard {
-                ProgressView().controlSize(.large)
-                Text("Connecting…").font(.title2)
+                if party.connectionFailed {
+                    Text("Couldn't connect directly").font(.title2)
+                    Text("This usually means one of your networks blocks it. A relay server fixes that (Settings ▸ Connection).")
+                        .multilineTextAlignment(.center).frame(maxWidth: 360)
+                    Button("Try again") { model.leaveParty() }.buttonStyle(.borderedProminent)
+                } else {
+                    ProgressView().controlSize(.large)
+                    Text("Connecting…").font(.title2)
+                }
             }
         case .together:
             if party.role == .host, let preparing = party.preparing {

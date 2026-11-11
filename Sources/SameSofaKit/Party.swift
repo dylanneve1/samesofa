@@ -66,6 +66,9 @@ public final class Party: ObservableObject {
     }
     /// "Sending the film: 126 MB of 2.1 GB · 5.2 MB/s", empty when nothing is moving.
     @Published public private(set) var transferLine = ""
+    /// ICE failed or timed out while setting up: the view offers "Try again".
+    @Published public private(set) var connectionFailed = false
+    private var connectTimeout: DispatchWorkItem?
     private var rateMark: (time: Date, bytes: Double)?
     private var smoothedRate: Double = 0
 
@@ -257,9 +260,11 @@ public final class Party: ObservableObject {
         case .joined(let code):
             self.code = code
             phase = .connecting
+            armConnectTimeout()
             startCall()
         case .peerJoined:
             phase = .connecting
+            armConnectTimeout()
             startCall()
             call?.makeOffer()
         case .signal(let payload):
@@ -294,7 +299,25 @@ public final class Party: ObservableObject {
         call.announceChannels()
     }
 
+    private func armConnectTimeout() {
+        connectionFailed = false
+        connectTimeout?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.phase == .connecting else { return }
+            self.failConnection()
+        }
+        connectTimeout = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: item)
+    }
+
+    private func failConnection() {
+        connectTimeout?.cancel()
+        connectionFailed = true
+        Log.debug("connection failed")
+    }
+
     private func teardownCall() {
+        connectTimeout?.cancel()
         pingTimer?.invalidate()
         pingTimer = nil
         control?.close()
@@ -433,7 +456,10 @@ extension Party: CallSessionDelegate {
     public func call(_ call: CallSession, connectionChanged connected: Bool) {
         guard call === self.call else { return }
         if connected {
+            connectTimeout?.cancel()
             phase = .together
+        } else if phase == .connecting {
+            failConnection()
         } else if phase == .together {
             // The peer connection dropped without a goodbye (network change, sleep).
             partnerLeft()

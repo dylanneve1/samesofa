@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import SameSofaCore
+import os
 import WebRTC
 
 /// Network settings for the peer connection.
@@ -250,7 +251,41 @@ public final class CallSession: NSObject, RTCPeerConnectionDelegate {
     public func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {}
     public func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
 
-    public func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {}
+    static let logger = Logger(subsystem: "app.samesofa", category: "connection")
+
+    /// States and candidate types only: never addresses, codes or content.
+    public func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
+        let name: String
+        switch newState {
+        case .new: name = "new"
+        case .checking: name = "checking"
+        case .connected: name = "connected"
+        case .completed: name = "completed"
+        case .failed: name = "failed"
+        case .disconnected: name = "disconnected"
+        case .closed: name = "closed"
+        case .count: name = "count"
+        @unknown default: name = "unknown"
+        }
+        Self.logger.info("ICE state: \(name, privacy: .public)")
+        if newState == .connected || newState == .completed { logSelectedPairType(peerConnection) }
+    }
+
+    private func logSelectedPairType(_ peerConnection: RTCPeerConnection) {
+        peerConnection.statistics { report in
+            let stats = report.statistics
+            let pairs = stats.values.filter { $0.type == "candidate-pair" && ($0.values["state"] as? String) == "succeeded" }
+            guard let pair = pairs.first(where: { ($0.values["nominated"] as? NSNumber)?.boolValue == true }) ?? pairs.first else {
+                Self.logger.info("selected candidate pair: not available yet")
+                return
+            }
+            func kind(_ key: String) -> String {
+                guard let id = pair.values[key] as? String, let c = stats[id] else { return "unknown" }
+                return (c.values["candidateType"] as? String) ?? "unknown"
+            }
+            Self.logger.info("selected candidate pair: local \(kind("localCandidateId"), privacy: .public), remote \(kind("remoteCandidateId"), privacy: .public)")
+        }
+    }
 
     public func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCPeerConnectionState) {
         DispatchQueue.main.async {
