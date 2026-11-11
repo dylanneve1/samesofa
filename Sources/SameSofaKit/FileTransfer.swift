@@ -196,6 +196,14 @@ public final class FileReceiver: NSObject, RTCDataChannelDelegate, AVAssetResour
         }
     }
 
+    /// Fetch this byte range first (the player is about to need it).
+    func prioritize(offset: Int64, length: Int64) {
+        queue.async {
+            self.scheduler.prioritize(offset: offset, length: length)
+            self.requestMore()
+        }
+    }
+
     private func requestMore() {
         let urgent = scheduler.hasUrgent
         // The player jumped: what was queued at the host for the old position is stale.

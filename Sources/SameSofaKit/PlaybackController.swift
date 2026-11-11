@@ -230,6 +230,7 @@ public final class PlaybackController: ObservableObject {
         send?(.timeline(t))
         position = clamped
         apply()
+        holdIfUnbuffered(at: clamped)
     }
 
     public func skip(by delta: Double) { seek(to: engine.targetPosition(at: sharedNow) + delta) }
@@ -237,7 +238,10 @@ public final class PlaybackController: ObservableObject {
     // MARK: From the other side
 
     func receive(_ timeline: Timeline) {
-        if engine.receive(timeline) { apply() }
+        if engine.receive(timeline) {
+            apply()
+            holdIfUnbuffered(at: engine.targetPosition(at: sharedNow))
+        }
     }
 
     func receiveHeartbeat(_ timeline: Timeline, actual: Double) {
@@ -406,6 +410,17 @@ public final class PlaybackController: ObservableObject {
             }
         }
         publishState()
+    }
+
+    /// A seek to a place the film hasn't reached yet: show buffering at once (both
+    /// sides pause together) and start fetching there, instead of waiting to notice a stall.
+    private func holdIfUnbuffered(at target: Double) {
+        guard let hasEnoughAhead, !engine.localBuffering, player.currentItem != nil, !hasEnoughAhead(target) else { return }
+        holdCount += 1
+        _ = engine.setLocalBuffering(true, now: sharedNow, actualPosition: target)
+        send?(.buffering(true, position: target))
+        seekPrecisely(to: target, thenPlay: false)
+        apply()
     }
 
     private func checkBuffering(now: Double, local: Double, actual: Double) {

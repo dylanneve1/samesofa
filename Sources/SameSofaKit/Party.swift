@@ -391,6 +391,7 @@ public final class Party: ObservableObject {
                 let offset = Int64(seconds * bytesPerSecond)
                 receiver.setPlayhead(offset: offset)
                 let needed = min(Double(info.size - offset), bytesPerSecond * 8)
+                if receiver.contiguousBytes(from: offset) == 0 { receiver.prioritize(offset: offset, length: Int64(needed)) }
                 return Double(receiver.contiguousBytes(from: offset)) >= needed
             }
             playback.load(asset: asset)
