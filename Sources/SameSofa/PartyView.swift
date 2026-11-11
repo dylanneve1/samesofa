@@ -29,7 +29,7 @@ struct PartyView: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                Color.black
+                if filmOnScreen { Color.black } else { Theme.background }
                 PlayerSurface(player: playback.player, frameRate: playback.frameRate,
                               playing: playback.intendsToPlay && !playback.isHeld, matchFrameRate: settings.matchFrameRate)
                     .opacity(filmOnScreen ? 1 : 0)
@@ -549,6 +549,7 @@ struct WaitingForPartnerCard: View {
         }
         .padding(.horizontal, 54).padding(.vertical, 40)
         .frame(maxWidth: 640)
+        .background(RoundedRectangle(cornerRadius: 30, style: .continuous).fill(.black.opacity(0.4)))
         .background(RoundedRectangle(cornerRadius: 30, style: .continuous).fill(.ultraThinMaterial))
         .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous).stroke(Theme.cardBorder))
         .shadow(color: .black.opacity(0.5), radius: 40)
@@ -560,6 +561,8 @@ struct StatusCard<Content: View>: View {
     var body: some View {
         VStack(spacing: 16) { content }
             .padding(.horizontal, 40).padding(.vertical, 30)
+            // Dark enough to read on a bright film.
+            .background(RoundedRectangle(cornerRadius: 24, style: .continuous).fill(.black.opacity(0.45)))
             .background(RoundedRectangle(cornerRadius: 24, style: .continuous).fill(.ultraThinMaterial))
             .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Theme.cardBorder))
     }
@@ -762,18 +765,35 @@ struct ScrubBar: View {
     var body: some View {
         GeometryReader { geo in
             let fraction = duration > 0 ? min(1, max(0, position / duration)) : 0
+            let height: CGFloat = hovering ? 7 : 5
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.white.opacity(0.18)).frame(height: hovering ? 7 : 5)
-                if ranges.isEmpty {
-                    Capsule().fill(Color.white.opacity(0.18)).frame(width: geo.size.width * available, height: hovering ? 7 : 5)
-                } else {
-                    ForEach(Array(ranges.enumerated()), id: \.offset) { _, range in
-                        RoundedRectangle(cornerRadius: 2).fill(Color.white.opacity(0.22))
-                            .frame(width: max(2, geo.size.width * (range.upperBound - range.lowerBound)), height: hovering ? 7 : 5)
-                            .offset(x: geo.size.width * range.lowerBound)
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.18)).frame(height: height)
+                    if ranges.isEmpty {
+                        Capsule().fill(Color.white.opacity(0.18)).frame(width: geo.size.width * available, height: height)
+                        Capsule().fill(Theme.accent).frame(width: max(0, geo.size.width * fraction), height: height)
+                    } else {
+                        // What has arrived: clearly brighter than what has not.
+                        ForEach(Array(ranges.enumerated()), id: \.offset) { _, range in
+                            Rectangle().fill(Color.white.opacity(0.4))
+                                .frame(width: max(2, geo.size.width * (range.upperBound - range.lowerBound)), height: height)
+                                .offset(x: geo.size.width * range.lowerBound)
+                        }
+                        // Up to the playhead: full colour where the film is here, faint where it is
+                        // not (going back there means waiting for it).
+                        Rectangle().fill(Theme.accent.opacity(0.38)).frame(width: max(0, geo.size.width * fraction), height: height)
+                        ForEach(Array(ranges.enumerated()), id: \.offset) { _, range in
+                            let end = min(range.upperBound, fraction)
+                            if end > range.lowerBound {
+                                Rectangle().fill(Theme.accent)
+                                    .frame(width: max(1, geo.size.width * (end - range.lowerBound)), height: height)
+                                    .offset(x: geo.size.width * range.lowerBound)
+                            }
+                        }
                     }
                 }
-                Capsule().fill(Theme.accent).frame(width: max(0, geo.size.width * fraction), height: hovering ? 7 : 5)
+                .frame(height: height)
+                .clipShape(Capsule())
                 Circle().fill(.white).frame(width: hovering ? 16 : 12, height: hovering ? 16 : 12)
                     .offset(x: geo.size.width * fraction - (hovering ? 8 : 6))
                     .shadow(radius: 3)

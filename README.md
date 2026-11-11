@@ -1,9 +1,13 @@
 # SameSofa
 
-Watch a film together when you are not in the same place. One of you picks a
-video file on their Mac, the other types a six-character code, and you both
-watch it in sync, with a little floating video call bubble so you can see and
-hear each other.
+Watch a film together when you are not in the same place. One of you opens a
+room, the other types a six-character code, and you see and hear each other.
+Pick a video file on the host's Mac whenever you like and you both watch it in
+sync, with the call in a little floating bubble over the film.
+
+- **The room does not depend on the film.** Start a room with no film at all
+  and just be together; choose a film later, change it, or close it. The call
+  never drops while you do: only **Leave** ends it.
 
 - **Play, pause and seek from either side.** Both players follow one shared
   timeline and correct themselves so they stay within a fraction of a second.
@@ -27,13 +31,16 @@ hear each other.
 - **Damaged files repaired.** Films whose video timing information is missing
   (frames would jump back and forth) are fixed on the host before sharing,
   without re-encoding.
+- **A film you have (partly) received is not sent twice.** If the same film
+  is shared again within a day, only what is missing travels.
 - **Private by design**: no accounts, no analytics, nothing stored on a server.
 
 ![Joined and ready to play](docs/screenshots/guest-joined.png)
 
 | | |
 |---|---|
-| ![Welcome](docs/screenshots/welcome.png) | ![Typing the code](docs/screenshots/join.png) |
+| ![Welcome: join, start a room, or host a film](docs/screenshots/welcome.png) | ![Typing the code](docs/screenshots/join.png) |
+| ![A room without a film: your partner fills the window](docs/screenshots/hangout.png) | ![The guest while the host picks another film](docs/screenshots/choosing.png) |
 | ![The host's code](docs/screenshots/host-waiting.png) | ![Playing, controls hidden](docs/screenshots/playing.png) |
 
 | | |
@@ -49,6 +56,39 @@ hear each other.
 
 *(Screenshots use a generated test film and a generated stand-in camera
 picture.)*
+
+### New in 1.3
+
+- **Rooms without a film.** *Start a room* opens a room with nothing to
+  watch: your partner joins with the code and you see and hear each other,
+  their camera filling the window, yours small in the corner. The host
+  chooses a film when you are ready (the button, a file dropped on the
+  window, File ▸ Open… or ⌘O).
+- **Changing film never drops the call.** The host can pick another film at
+  any time, or close the film (⇧⌘W) to go back to just being together. The
+  connection, the call and the room code stay as they are; only the film
+  starts over. The guest sees "Your partner is choosing another film…".
+- **Leave is the only thing that ends the call.** It is a labelled button now;
+  closing or changing the film does not leave the room.
+- **Resume.** The guest's copy of a film, complete or not, stays on their Mac
+  for 24 hours (up to 20 GB, the oldest first; Settings ▸ Films changes the
+  limit, switches it off or removes the kept films). When the same film is
+  shared again, after a change of film, or after either of you reopened the
+  app, only the missing parts are sent, and the seek bar shows at once what
+  is already there. A finished copy is checked against a hash of the whole
+  film. Films the host had to convert are kept the same way, so they are not
+  converted twice.
+- **A press of a button no longer vanishes** when the other side's player
+  changes the timeline at the same instant (for instance the automatic
+  restart after buffering).
+- **Clock sync under load.** The guest's estimate of the host's clock is no
+  longer thrown off by a film that fills the link in one direction.
+- **Match display to film** never takes a switch on trust: if the display
+  does not report the new mode, falls out of it, or the picture does not
+  come back, the original mode is put back and the ⓘ readout says so.
+- With a partner on 1.2.1 or older everything works as before; the host is
+  told "Your partner needs SameSofa 1.3 for rooms without a film" and what to
+  do instead.
 
 ### New in 1.2.1
 
@@ -105,10 +145,16 @@ picture.)*
 ### Watching
 
 - **If you're joining:** click **Join** and type the code your partner reads to
-  you. That's it. The film appears and starts as soon as enough of it has
+  you. That's it. You see and hear each other straight away; a film appears
+  and starts as soon as your partner has chosen one and enough of it has
   arrived.
-- **If you're hosting:** click **Host**, pick the film (or drop it on the
-  window), and read the code on screen to your partner.
+- **If you're hosting:** click **Start a room** to just be together first, or
+  **Host a film** to pick the film straight away (or drop it on the window),
+  and read the code on screen to your partner.
+- **Another film, or none:** the host clicks **Change film** or **Close film**
+  at the top of the film (or drops another file on the window). You stay
+  connected. **Leave** (top left) is what ends the call; when the host leaves,
+  the room closes.
 - Either of you can press **Play together**, pause, or skip. Move the mouse to
   bring the controls back. Double-click the film (or press **F**) for full
   screen. **Space** plays/pauses, **←/→** skip 10 seconds, **M** mutes you.
@@ -176,8 +222,8 @@ told straight away if a film can't be used.
    Host Mac                                               Guest Mac
  ┌────────────────────────┐                        ┌────────────────────────┐
  │ AVPlayer (local file)  │  control channel: play/pause/seek, heartbeats,  │
- │ SyncEngine ◄───────────┼──── clock ping/pong, chunk requests ──────────►│ SyncEngine
- │ FileSender ────────────┼──── file channel: original bytes (64 KiB) ────►│ FileReceiver → sparse temp file
+ │ SyncEngine ◄───────────┼─ clock ping/pong, chunk requests, which film ──►│ SyncEngine
+ │ FileSender ────────────┼─ one channel per film: original bytes (64 KiB) ►│ FileReceiver → sparse file (kept 24 h)
  │                        │                                                 │   → AVAssetResourceLoader → AVPlayer
  │ AudioHub (call audio,  │◄─── WebRTC audio + video (camera, mic) ───────►│ AudioHub
  │  AEC3 on the mic)      │        all peer to peer, DTLS/SRTP encrypted    │
@@ -185,6 +231,33 @@ told straight away if a film can't be used.
             │  WebSocket: "create room" / "join ABC123" / relay offer, answer, ICE        │
             └──────────────────────► server/ (tiny Node room server) ◄──────────────────┘
 ```
+
+### The room, the call and the film are separate things
+
+A room is two people and a peer connection: camera and microphone both ways
+and a "control" data channel. A film is something the host adds to it and
+takes away again:
+
+- Every film gets **a data channel of its own** on the same peer connection
+  (no renegotiation, the call is not touched). When the host changes or
+  closes the film, that channel is closed: what was still queued on it is
+  dropped, and whatever is already on its way arrives on a channel nobody
+  listens to any more, so no byte of one film can end up in another. (The
+  first film of a connection uses the channel named `file`, which is what
+  versions before 1.3 expect.)
+- Every change gets **the next film number**. The host says "film 3 is being
+  looked at", "film 3 is this: …" or "no film"; the guest answers "from here
+  on I am talking about film 3". Until that answer arrives, the host ignores
+  the guest's chunk requests, progress and play/pause/seek: they were sent
+  for the film before.
+- The **shared timeline starts afresh** for every film, paused at the start,
+  and its sequence numbers jump by 1000 instead of starting again at zero. A
+  play or seek that was under way for the old film, however late it arrives
+  and from whichever side, is older than the new film's first timeline and
+  is dropped by the ordinary "newer wins" rule.
+- The host's Mac checks a newly picked file (and converts it if it has to)
+  while the two of you keep talking; the guest sees "Your partner is choosing
+  another film…", then the usual preparing and receiving messages.
 
 ### Getting the film to the guest: the original bytes, over a data channel
 
@@ -205,9 +278,27 @@ and the guest plays it from a local sparse file through
   dry, **both** sides pause ("Waiting for your partner to catch up…") and the
   host restarts both together when the guest is ready again;
 - the whole file keeps arriving in the background and is checked byte for byte
-  in the integration test. The guest's copy lives in a temporary folder and is
-  deleted when the session ends (and at the start of the next one, in case the
-  app was force-quit).
+  in the integration test.
+
+**Resuming.** The host describes each film with its size and a SHA-256 over
+24 blocks sampled along the file (a *fingerprint*: cheap even for a 50 GB
+file). The guest receives into `~/Library/Caches/app.samesofa.mac/Films/`,
+one folder per fingerprint, and writes down which chunks have arrived (a bit
+per chunk, every two seconds and when the film ends). When a film with a
+known fingerprint is announced, the guest starts from that map: the seek bar
+shows the kept parts on both sides before the first new chunk arrives, and
+only the missing chunks are requested, none if the copy was complete. The
+host also sends the SHA-256 of the whole file (worked out in the background);
+a complete copy is compared with it, and if a resumed copy does not match,
+the resumed part is fetched again. Kept films are removed after 24 hours
+without use and, least recently used first, when they take more than the
+limit (20 GB by default; a film bigger than the limit is received into a
+temporary file and deleted with the session, as before 1.3). A film in use
+is never removed. Converting with the Mac's hardware encoder does not give
+the same bytes twice, so the host keeps the films it converted in the same
+cache, keyed by the source's fingerprint and the exact conversion: sharing
+the film again converts nothing and sends the very same bytes, which is what
+lets the guest's copy match.
 
 Re-encoding into a WebRTC video track would have been simpler to start but
 loses quality, costs CPU on the host for the whole film, and makes the call and
@@ -267,8 +358,20 @@ Both apps run the same `SyncEngine` (in `Sources/SameSofaCore`, unit tested):
   playing or paused". Any button press on either side creates a new timeline
   with a higher sequence number; simultaneous presses resolve the same way on
   both sides (higher sequence wins, host breaks ties).
-- The guest measures the **clock offset** to the host NTP-style (ping/pong on the
-  control channel, minimum-round-trip sample wins).
+- The guest measures the **clock offset** to the host NTP-style (ping/pong on
+  the control channel). Each exchange measures the way there and the way back
+  separately; the smallest of each over the last 30 exchanges are used, and
+  they need not come from the same exchange. (Using the one exchange with the
+  shortest round trip, as before 1.3, is off by half that round trip when the
+  film fills the link in one direction: measured, 5 starts in 50 were off by
+  7 ms on a saturated loopback link, none in 50 with the new estimate.) Times
+  are taken the moment a message arrives, and the host says how long it held a
+  ping before answering.
+- If a button is pressed on the guest's side at the very moment the host
+  changes the timeline (a person, or the host's player restarting after
+  buffering), both timelines carry the same sequence number and the host's
+  wins. The guest then gives its command again on top of the host's, so the
+  press is not lost.
 - Play is scheduled ~0.35 s in the future and started with
   `AVPlayer.setRate(_:time:atHostTime:)` so both start on the same instant.
 - Every half second the guest compares its player with the timeline: gaps under
@@ -367,9 +470,13 @@ session.
 - **STUN** servers (by default Google's and Cloudflare's public ones) see your
   public IP address so your Mac can learn it. If you configure a **TURN** relay,
   that relay carries your encrypted traffic but cannot decrypt it.
-- No accounts, no analytics, no crash reporting, nothing written anywhere except
-  the guest's temporary copy of the film (deleted after the session) and your
-  settings in the app's preferences.
+- No accounts, no analytics, no crash reporting. What is written to disk: your
+  settings in the app's preferences, and, so that a film can be resumed, the
+  guest's copy of a film and films the host converted, in the app's caches
+  folder (`~/Library/Caches/app.samesofa.mac/Films`) for 24 hours, 20 GB at
+  most. *Settings ▸ Films* changes the limit, switches keeping off (films then
+  go to a temporary file that is deleted with the session) or removes what is
+  kept now.
 
 ---
 
@@ -521,12 +628,17 @@ I=.build/debug/samesofa-itest; S=ws://127.0.0.1:18787
 $I --server $S --film big.mp4 --throttle 5000000 --seek-test 1       # seeks into film that hasn't arrived
 $I --server $S --film big.mp4 --throttle 5000000 --reconnect-test 1  # the call drops mid-film; Try again on each side
 $I --server $S --film big.mp4 --throttle 1000000 --control-latency 1 # pause/play latency under a saturated upload
+$I --server $S --room-test a.mp4,b.mp4           # 1.3: a room without a film, film A, change to B mid-transfer, close, A again (resumed)
+$I --server $S --resume-test a.mp4,b.mp4,rewrapped.mkv,converted.mkv   # resuming across relaunches, converted films, a damaged copy, the size limit
+$I --server $S --film big.mp4 --throttle 1000000 --control-stress 500  # 500 commands from both sides under a saturated upload; none may be lost
+SAMESOFA_TEST_CONTROL_DELAY_MS=40 $I --server $S --film test.mp4 --tie-stress 100   # both press at the same moment (40 ms apart in network terms)
+$I --server $S --film big.mp4 --clock-only 1     # clock offset while the film saturates the link (run it in a loop)
 $I --connection-test $S              # Settings ▸ Test connection, with a stand-in TURN relay in the test
 $I --timestamp-suite /tmp/ts         # damaged video timing: detection, repair, fallback
 $I --timestamp-edge-suite /tmp/ts    # time bases, start offsets, variable rate, MPEG-TS, injected wrong repairs
 $I --audio-thread-test 1             # the call's two audio threads against each other; microphone formats 8-192 kHz
 $I --audio-engine-test film.mp4      # the real audio engine at zero volume (add --real-output-switch 1 to change the default output for real)
-$I --display-mode-test 1             # the display's modes and the plan (add --switch 1 to switch and restore for real)
+$I --display-mode-test 1             # simulated displays that refuse, ignore or lose a mode; this display's modes and the plan (add --switch 1 to switch and restore for real)
 $I --receiver-folder-test 1          # two copies on one Mac keep their own films
 $I --device-smoke 1                  # this Mac's real microphone and output, silently (see below)
 ```
@@ -642,17 +754,25 @@ scripts/                  build.sh, fetch-webrtc.sh, build-apm.sh, build-ffmpeg.
   uplink the call video is capped at 700 kbit/s, but a large file transfer can
   still make the call choppier until the guest has enough buffered.
 - Reconnecting after a drop needs the room server: if that is unreachable
-  too, or the app is quit, the guest has to join again and the film is sent
-  again from the start (nothing is resumed across a relaunch).
+  too, or the app is quit, the guest has to join again (what it has of the
+  film is kept and only the rest is sent).
+- Rooms without a film, changing film and resuming were tested on one Mac
+  over loopback, between two copies of 1.3 and against 1.2.1, 1.2.0 and 1.1.0
+  in both roles. Not tested: two real Macs on two real networks, films of
+  several GB (the fingerprint and the cache were exercised with films of
+  10 to 570 MB), a disk that fills up in the middle of a film.
+- A partner on 1.2.1 or older cannot be in a room without a film (their
+  window shows "Getting the film ready" until the host picks one) and cannot
+  follow a change of film: the host is told so, and the film buttons are
+  switched off once that partner has a film.
 - Reconnecting, the output-device change and the microphone path were tested
   on one Mac without a microphone (simulated drops, a stand-in second output
   device, synthetic microphone formats). Run `samesofa-itest --device-smoke 1`
   on a Mac with a real microphone.
 - A partner on 1.2.0 or earlier does not reconnect in place (it has to
-  rejoin) and shows no version note; 1.1.0 and 1.2.0 were tested against
-  1.2.1 in both roles on one Mac.
+  rejoin) and shows no version note.
 - The guest needs free disk space roughly the size of the film.
-- One film per session; to switch films, leave and host again.
+- No queue of films ("up next") yet: the host picks the next film by hand.
 - Converting (not just rewrapping) a film takes minutes and the guest can't
   start before it's done. Re-encoded video loses a little quality.
 - Only one audio track and one subtitle track are carried; picture-based

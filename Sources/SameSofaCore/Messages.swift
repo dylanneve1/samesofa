@@ -164,7 +164,7 @@ public enum ControlMessage: Codable, Equatable, Sendable {
         }
         if theirs < ours {
             if theirs < filmChangeVersion, ours >= filmChangeVersion {
-                return .note("Your partner needs SameSofa 1.3 for rooms without a film and for changing film. Other things may not work either until they update.")
+                return .note("Your partner needs SameSofa 1.3 for rooms without a film and for changing film.")
             }
             return .note("Your partner has an older SameSofa. Some things may not work until they update.")
         }

@@ -250,9 +250,12 @@ struct ShortcutsView: View {
         ("F", "Full screen"),
         ("M", "Mute or unmute your microphone"),
         ("Esc", "Leave full screen"),
+        ("⌘O", "Choose a film (the host; the call goes on)"),
+        ("⇧⌘W", "Close the film, stay in the room (the host)"),
     ]
     /// How VoiceOver should say the keys.
-    static let spoken = ["Space": "Space bar", "←  →": "Left arrow and right arrow", "F": "F", "M": "M", "Esc": "Escape"]
+    static let spoken = ["Space": "Space bar", "←  →": "Left arrow and right arrow", "F": "F", "M": "M", "Esc": "Escape",
+                         "⌘O": "Command O", "⇧⌘W": "Shift Command W"]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -272,7 +275,7 @@ struct ShortcutsView: View {
                     .accessibilityAddTraits(.isStaticText)
                 }
             }
-            Text("They work while a film is open. Play, pause and seeking always apply to both of you.")
+            Text("Play, pause and seeking work while a film is open and always apply to both of you. Changing or closing the film never ends the call; only Leave does.")
                 .font(.callout).foregroundStyle(Theme.secondaryText).fixedSize(horizontal: false, vertical: true)
         }
         .padding(24)

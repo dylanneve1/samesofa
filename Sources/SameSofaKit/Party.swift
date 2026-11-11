@@ -238,6 +238,10 @@ public final class Party: ObservableObject {
         let number = beginFilmChange(name: film.deletingPathExtension().lastPathComponent)
         Task { @MainActor in
             do {
+                // Screenshots only: time to capture "your partner is choosing another film".
+                if let slow = ProcessInfo.processInfo.environment["SAMESOFA_TEST_SLOW_INSPECT"].flatMap(Double.init) {
+                    try? await Task.sleep(for: .seconds(slow))
+                }
                 let check = try await inspect(film)
                 // Changed again (or closed) while this file was being looked at.
                 guard self.turn.current == number, self.choosingFilm else { return }
