@@ -216,6 +216,9 @@ public struct ConversionPlan: Equatable, Sendable {
     public var repairVideoTimestamps = false
     /// Exact times for the film's last few samples, which dts2pts cannot work out.
     public var timestampTail: [TimestampTail.Correction] = []
+    /// Decode time, as stored in the file, of the first video sample that is
+    /// copied; the tail's samples are recognised by their distance from it.
+    public var timestampBase: Int64?
     /// What to do with the video if it is copied and the copy turns out
     /// unusable (the timestamp repair doesn't validate): re-encode like this.
     public var videoFallback: VideoAction?
@@ -274,7 +277,7 @@ public struct ConversionPlan: Equatable, Sendable {
             switch video.action {
             case .copy(let tagHvc1):
                 a += ["-c:v", "copy"]
-                if repairVideoTimestamps { a += ["-bsf:v", TimestampTail.bitstreamFilter(tail: timestampTail)] }
+                if repairVideoTimestamps { a += ["-bsf:v", TimestampTail.bitstreamFilter(tail: timestampTail, firstDecodeTime: timestampBase)] }
                 if tagHvc1 { a += ["-tag:v", "hvc1"] }
             case .encode(let codec, let tenBit, let bitRate, let gop, let deinterlace):
                 if deinterlace { a += ["-vf", "yadif=mode=send_frame:deint=interlaced"] }

@@ -111,7 +111,10 @@ public final class FilmPreparer {
             Log.debug("timestamp check for \(film.lastPathComponent): \(report.backwardSteps) of \(report.frames) frames out of order")
             if report.isDamaged {
                 plan.repairVideoTimestamps = true
-                plan.timestampTail = await timestampTail(film, duration: probe.duration, tools: tools)
+                if let tail = await timestampTail(film, duration: probe.duration, tools: tools) {
+                    plan.timestampTail = tail.corrections
+                    plan.timestampBase = tail.base
+                }
                 plan.needsConversion = true
                 plan.notes.append("video timestamps contradict the picture order (\(report.backwardSteps) of \(report.frames) frames): rebuilding them")
             }
@@ -147,65 +150,80 @@ public final class FilmPreparer {
         return report.frames > 0 ? report : nil
     }
 
-    /// Exact presentation times for the film's last samples (see TimestampTail).
-    /// Empty when they could not be worked out; the repair then leaves the
-    /// last one to three frames as dts2pts made them.
-    static func timestampTail(_ film: URL, duration: Double, tools: FFmpegTools) async -> [TimestampTail.Correction] {
-        func base(_ text: Substring) -> (Int64, Int64)? {
-            let parts = text.split(separator: "/")
-            guard parts.count == 2, let n = Int64(parts[0]), let d = Int64(parts[1]), n > 0, d > 0 else { return nil }
-            return (n, d)
-        }
+    /// Exact presentation times for the film's last samples (see
+    /// TimestampTail), and the decode time of the first sample FFmpeg will
+    /// copy. nil when they could not be worked out; the repair then leaves
+    /// the last frames as dts2pts made them, which the validation rejects.
+    static func timestampTail(_ film: URL, duration: Double, tools: FFmpegTools) async -> (base: Int64, corrections: [TimestampTail.Correction])? {
         func lines(_ data: Data) -> [[Substring]] {
             String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).map { $0.split(separator: ",", omittingEmptySubsequences: false) }
         }
-        // The reorder delay dts2pts uses: let it write the film's first sample and look at it.
+        // The reorder delay dts2pts uses, in frames: let it write the film's first samples and look at them.
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let head = directory.appendingPathComponent("head-\(UUID().uuidString).mp4")
         defer { try? FileManager.default.removeItem(at: head) }
-        let headArgs = ["-v", "error", "-y", "-i", film.path, "-map", "0:v:0", "-c", "copy", "-bsf:v", "dts2pts", "-frames:v", "1", "-f", "mp4", head.path]
-        let probeArgs = ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=time_base:packet=pts,dts", "-of", "csv=p=1"]
+        let headArgs = ["-v", "error", "-y", "-i", film.path, "-map", "0:v:0", "-c", "copy", "-bsf:v", "dts2pts", "-frames:v", "48", "-f", "mp4", head.path]
+        let packetArgs = ["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts,dts", "-of", "csv=p=0"]
         guard (try? await run(tools.ffmpeg, headArgs, timeout: 60)) != nil,
-              let headData = try? await run(tools.ffprobe, probeArgs + [head.path], timeout: 60) else { return [] }
-        var headBase: (Int64, Int64)?, headDelay: Int64?
-        for fields in lines(headData) where fields.count >= 2 {
-            if fields[0] == "stream" { headBase = base(fields[1]) }
-            if fields[0] == "packet", fields.count >= 3, headDelay == nil, let pts = Int64(fields[1]), let dts = Int64(fields[2]) { headDelay = pts - dts }
+              let headData = try? await run(tools.ffprobe, packetArgs + [head.path], timeout: 60) else { return nil }
+        let headSamples: [TimestampTail.Sample] = lines(headData).compactMap { fields in
+            guard fields.count >= 2, let pts = Int64(fields[0]), let dts = Int64(fields[1]) else { return nil }
+            return TimestampTail.Sample(pts: pts, dts: dts)
         }
+        guard let delay = TimestampTail.reorderDelay(head: headSamples), delay > 0 else { return nil }
+        // The first sample FFmpeg copies: the first key frame (anything before it is dropped).
+        let firstArgs = ["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=dts,flags", "-of", "csv=p=0",
+                         "-read_intervals", "%+#64", film.path]
+        guard let firstData = try? await run(tools.ffprobe, firstArgs, timeout: 60) else { return nil }
+        var base: Int64?
+        for fields in lines(firstData) where fields.count >= 2 {
+            guard let dts = Int64(fields[0]) else { return nil }
+            if fields[1].contains("K") { base = dts; break }
+        }
+        guard let base else { return nil }
         // The film's last seconds: samples in decode order, pictures in the decoder's display order.
-        let tailArgs = ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=time_base:packet=pts,dts:frame=pts", "-of", "csv=p=1",
+        let tailArgs = ["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts,dts:frame=pts", "-of", "csv=p=1",
                         "-read_intervals", String(format: "%.0f%%", max(0, duration - 4)), film.path]
-        guard let tailData = try? await run(tools.ffprobe, tailArgs, timeout: 90), let headBase, var delay = headDelay, delay >= 0 else { return [] }
-        var order: [Int64] = [], decodeTimes = Set<Int64>(), streamBase: (Int64, Int64)?
+        guard let tailData = try? await run(tools.ffprobe, tailArgs, timeout: 90) else { return nil }
+        var order: [Int64] = [], decodeTimes = Set<Int64>()
         for fields in lines(tailData) where fields.count >= 2 {
             switch fields[0] {
-            case "stream": streamBase = base(fields[1])
             case "packet":
                 // Only the plain form of the defect (presentation time = decode time) can be mapped back to samples.
-                guard fields.count >= 3, let pts = Int64(fields[1]), let dts = Int64(fields[2]), pts == dts else { return [] }
+                guard fields.count >= 3, let pts = Int64(fields[1]), let dts = Int64(fields[2]), pts == dts else { return nil }
                 decodeTimes.insert(dts)
             case "frame":
                 if let pts = Int64(fields[1]) { order.append(pts) }
             default: break
             }
         }
-        guard let streamBase, order.count >= 8, Set(order).isSubset(of: decodeTimes) else { return [] }
-        if headBase != streamBase {
-            // The delay in the film's own time base must be a whole number of ticks.
-            let numerator = delay * headBase.0 * streamBase.1, denominator = headBase.1 * streamBase.0
-            guard numerator % denominator == 0 else { return [] }
-            delay = numerator / denominator
-        }
-        return TimestampTail.corrections(outputOrder: order, delay: delay, count: 12)
+        guard order.count >= 8, Set(order).isSubset(of: decodeTimes) else { return nil }
+        // dts2pts makes up more than the last `delay` times: everything it still held when the
+        // film ended. Correcting further back is harmless (the times are the ones it gives
+        // anyway), but the first pictures of the stretch may depend on what came before it.
+        let corrections = TimestampTail.corrections(outputOrder: order, delayFrames: delay, count: min(64, order.count / 2))
+        return corrections.isEmpty ? nil : (base, corrections)
     }
 
-    /// Decoder order against presentation times over the film's last seconds.
+    /// The repaired film's last seconds: the decoder's order agrees with the
+    /// presentation times (no step back, no repeat), and the last samples'
+    /// times are exactly what the repair should have produced.
     static func tailIsInOrder(_ film: URL, duration: Double, tools: FFmpegTools) async -> Bool {
-        let args = ["-v", "error", "-select_streams", "v:0", "-show_entries", "frame=pts", "-of", "csv=p=0",
+        let args = ["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts,dts:frame=pts", "-of", "csv=p=1",
                     "-read_intervals", String(format: "%.0f%%", max(0, duration - 4)), film.path]
         guard let data = try? await run(tools.ffprobe, args, timeout: 90) else { return false }
-        let report = TimestampReport.parse(ffprobeFrameTimes: String(decoding: data, as: UTF8.self))
-        return report.frames > 0 && report.backwardSteps == 0
+        var frameTimes = "", samples: [TimestampTail.Sample] = []
+        for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            let fields = line.split(separator: ",", omittingEmptySubsequences: false)
+            if fields.count >= 3, fields[0] == "packet", let pts = Int64(fields[1]), let dts = Int64(fields[2]) {
+                samples.append(TimestampTail.Sample(pts: pts, dts: dts))
+            } else if fields.count >= 2, fields[0] == "frame" {
+                frameTimes += fields[1] + "\n"
+            }
+        }
+        let report = TimestampReport.parse(ffprobeFrameTimes: frameTimes, repeatsCount: true)
+        guard report.frames > 0, report.backwardSteps == 0 else { return false }
+        return TimestampTail.tailIsConsistent(samples)
     }
 
     /// After a timestamp repair: is the result really in order?
@@ -239,10 +257,10 @@ public final class FilmPreparer {
             Log.debug("repair check: \(before) frames in, \(after) out")
             return false
         }
-        // 4. AVFoundation decodes the start and the middle with rising presentation times.
+        // 4. AVFoundation decodes the start, the middle and the end with rising presentation times.
         let asset = AVURLAsset(url: output)
         guard let track = try? await asset.loadTracks(withMediaType: .video).first else { return false }
-        for start in duration > 30 ? [0, duration / 2] : [0] {
+        for start in duration > 30 ? [0, duration / 2, duration - 10] : [0] {
             guard let reader = try? AVAssetReader(asset: asset) else { return false }
             let out = AVAssetReaderTrackOutput(track: track, outputSettings: [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,

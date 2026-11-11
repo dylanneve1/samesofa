@@ -49,6 +49,10 @@ if let directory = args["timestamp-suite"] {
                        healthy: (args["healthy"] ?? "").split(separator: ",").map { URL(fileURLWithPath: String($0)) })
 }
 
+if let directory = args["timestamp-edge-suite"] {
+    TimestampEdgeSuite.run(workDirectory: URL(fileURLWithPath: directory), referenceFFmpeg: args["reference-ffmpeg"] ?? "/opt/homebrew/bin/ffmpeg", only: args["only"])
+}
+
 // Conversion suite: MKV/AVI/... converted on the host, played in sync on the guest.
 if let list = args["convert-bench"] {
     ConversionSuite(server: URL(string: "ws://unused")!, referenceFFmpeg: nil)

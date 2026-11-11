@@ -234,8 +234,12 @@ final class MediaPlanTests: XCTestCase {
         XCTAssertFalse(plan.needsConversion, "a healthy file is shared as it is")
         plan.repairVideoTimestamps = true
         plan.timestampTail = [.init(decodeTime: 955_955, presentationTime: 958_958)]
+        XCTAssertEqual(plan.ffmpegArguments(input: "a.mp4", output: "b.mp4").first { $0.hasPrefix("dts2pts") }, "dts2pts",
+                       "without the first sample's decode time the tail cannot be addressed")
+        plan.timestampBase = -2002
         let args = plan.ffmpegArguments(input: "a.mp4", output: "b.mp4")
-        XCTAssertEqual(args[try XCTUnwrap(args.firstIndex(of: "-bsf:v")) + 1], "dts2pts,setts=pts=if(eq(DTS\\,955955)\\,958958\\,PTS)")
+        XCTAssertEqual(args[try XCTUnwrap(args.firstIndex(of: "-bsf:v")) + 1],
+                       "dts2pts,setts=pts=if(eq(DTS-STARTDTS\\,957957)\\,STARTDTS+(960960)\\,PTS)")
         XCTAssertTrue(plan.isRemuxOnly, "repairing copies the streams")
         let fallback = try XCTUnwrap(plan.fallbackPlan)
         XCTAssertTrue(fallback.reencodesVideo)
@@ -269,8 +273,8 @@ final class MediaPlanTests: XCTestCase {
 
     func testTimestampTail() {
         // The end of an H.264 clip: decode order ... 508928 509440 509952 510464, displayed 508928 509440 510464 509952
-        // (the last two swap), reorder delay 1024.
-        let corrections = TimestampTail.corrections(outputOrder: [507_904, 508_416, 508_928, 509_440, 510_464, 509_952], delay: 1024, count: 3)
+        // (the last two swap), reorder delay 2 frames of 512.
+        let corrections = TimestampTail.corrections(outputOrder: [507_904, 508_416, 508_928, 509_440, 510_464, 509_952], delayFrames: 2, count: 3)
         let expected: [TimestampTail.Correction] = [
             TimestampTail.Correction(decodeTime: 509_440, presentationTime: 510_464),
             TimestampTail.Correction(decodeTime: 509_952, presentationTime: 511_488),
@@ -278,7 +282,7 @@ final class MediaPlanTests: XCTestCase {
         ]
         XCTAssertEqual(corrections, expected)
         XCTAssertEqual(Set(corrections.map(\.presentationTime)).count, 3)
-        XCTAssertTrue(TimestampTail.corrections(outputOrder: [1, 1, 2], delay: 0, count: 2).isEmpty, "ambiguous input is left alone")
+        XCTAssertTrue(TimestampTail.corrections(outputOrder: [1, 1, 2], delayFrames: 0, count: 2).isEmpty, "ambiguous input is left alone")
         XCTAssertEqual(TimestampTail.bitstreamFilter(tail: []), "dts2pts")
     }
 
