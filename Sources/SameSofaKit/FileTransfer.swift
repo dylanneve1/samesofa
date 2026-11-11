@@ -145,12 +145,11 @@ public final class FileReceiver: NSObject, RTCDataChannelDelegate, AVAssetResour
 
     public init(info: FileInfo) throws {
         self.info = info
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SameSofa", isDirectory: true)
+        // One folder per running copy of the app: a second copy on the same
+        // Mac (or a test running next to it) keeps its own film.
+        ReceivedFilms.removeLeftovers()
+        let dir = ReceivedFilms.directory
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        // Old partial films from earlier sessions are not needed any more.
-        if let old = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-            for url in old { try? FileManager.default.removeItem(at: url) }
-        }
         let ext = (info.name as NSString).pathExtension
         cacheURL = dir.appendingPathComponent(UUID().uuidString).appendingPathExtension(ext.isEmpty ? "mp4" : ext)
         FileManager.default.createFile(atPath: cacheURL.path, contents: nil)
@@ -299,6 +298,36 @@ public final class FileReceiver: NSObject, RTCDataChannelDelegate, AVAssetResour
             queue.asyncAfter(deadline: .now() + 0.02) {
                 self.serviceScheduled = false
                 self.serviceLoadingRequests()
+            }
+        }
+    }
+}
+
+/// Where a guest keeps the film it is receiving: `<temporary folder>/SameSofa/<process id>/`.
+/// Whatever a copy of the app that is no longer running left behind is
+/// removed the next time a film is received; a copy that is still running
+/// keeps its files.
+public enum ReceivedFilms {
+    public static var parent: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("SameSofa", isDirectory: true)
+    }
+
+    public static var directory: URL {
+        parent.appendingPathComponent(String(ProcessInfo.processInfo.processIdentifier), isDirectory: true)
+    }
+
+    public static func removeLeftovers() {
+        let fm = FileManager.default
+        for name in (try? fm.contentsOfDirectory(atPath: parent.path)) ?? [] {
+            let url = parent.appendingPathComponent(name)
+            if let pid = Int32(name), pid > 0 {
+                // Our own folder and those of copies that are still running stay.
+                if pid == ProcessInfo.processInfo.processIdentifier || kill(pid, 0) == 0 || errno == EPERM { continue }
+                try? fm.removeItem(at: url)
+            } else if let modified = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+                      Date().timeIntervalSince(modified) > 24 * 3600 {
+                // A film left loose in the folder by 1.2.0 or earlier, not touched for a day.
+                try? fm.removeItem(at: url)
             }
         }
     }

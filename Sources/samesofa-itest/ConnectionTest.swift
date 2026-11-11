@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import SameSofaCore
 import SameSofaKit
 
 // Settings ▸ Connection ▸ Test connection, against a room server on this Mac
@@ -188,5 +189,37 @@ final class FakeRelay {
         lock.lock(); allocationCount += 1; lock.unlock()
         let relayed = xorAddress(0x0016, port: 50_000, address: clientAddress)
         return message(0x0103, request: request, attributes: relayed + xorAddress(0x0020, port: clientPort, address: clientAddress) + lifetime, signed: true)
+    }
+}
+
+// Two copies of the app on one Mac must not delete each other's film:
+//
+//   samesofa-itest --receiver-folder-test 1
+enum ReceiverFolderTest {
+    static func run() -> Never {
+        let fm = FileManager.default
+        let parent = ReceivedFilms.parent
+        // A copy that is no longer running, one that still is (process 1 always exists), and a loose old file.
+        let dead = parent.appendingPathComponent("999999"), alive = parent.appendingPathComponent("1")
+        let loose = parent.appendingPathComponent("left-by-an-old-version.mp4"), recent = parent.appendingPathComponent("recent-loose.mp4")
+        for folder in [dead, alive] {
+            try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            fm.createFile(atPath: folder.appendingPathComponent("film.mp4").path, contents: Data([1, 2, 3]))
+        }
+        fm.createFile(atPath: loose.path, contents: Data([1]), attributes: [.modificationDate: Date().addingTimeInterval(-3 * 24 * 3600)])
+        fm.createFile(atPath: recent.path, contents: Data([1]))
+        let info = FileInfo(size: 1 << 20, name: "film.mp4", uti: "public.mpeg-4")
+        guard let first = try? FileReceiver(info: info), let second = try? FileReceiver(info: info) else {
+            ConnectionTest.check("receivers created", false)
+            ConnectionTest.finish()
+        }
+        ConnectionTest.check("a second receiver leaves the first one's film alone", fm.fileExists(atPath: first.cacheURL.path) && fm.fileExists(atPath: second.cacheURL.path))
+        ConnectionTest.check("films are kept in this process's own folder", first.cacheURL.deletingLastPathComponent().lastPathComponent == String(getpid()))
+        ConnectionTest.check("a running copy's folder is kept", fm.fileExists(atPath: alive.appendingPathComponent("film.mp4").path))
+        ConnectionTest.check("a dead copy's folder is removed", !fm.fileExists(atPath: dead.path))
+        ConnectionTest.check("an old loose film is removed, a recent one is kept", !fm.fileExists(atPath: loose.path) && fm.fileExists(atPath: recent.path))
+        try? fm.removeItem(at: alive)
+        try? fm.removeItem(at: recent)
+        ConnectionTest.finish()
     }
 }

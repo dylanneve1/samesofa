@@ -69,6 +69,14 @@ public final class Party: ObservableObject {
     /// ICE failed or timed out while setting up: the view offers "Try again".
     @Published public private(set) var connectionFailed = false
     private var connectTimeout: DispatchWorkItem?
+    /// The call dropped after it had been up (network change, sleep, a
+    /// flaky link) and is being set up again in the same room. The film is
+    /// held meanwhile; what has been received stays.
+    @Published public private(set) var reconnecting = false
+    /// How often the call was set up again (diagnostics, tests).
+    public private(set) var reconnects = 0
+    private var lastRestart = Date.distantPast
+    private var dropGrace: DispatchWorkItem?
     private var rateMark: (time: Date, bytes: Double)?
     private var smoothedRate: Double = 0
 
@@ -268,6 +276,13 @@ public final class Party: ObservableObject {
             startCall()
             call?.makeOffer()
         case .signal(let payload):
+            // "restart": the host is about to offer a fresh call. "retry": the guest asks for one.
+            // Older versions ignore both (they carry no description and no candidate).
+            if payload["sdp"] == nil, payload["candidate"] == nil, let kind = payload["kind"] as? String {
+                if kind == "restart", role == .guest { restartCall() }
+                if kind == "retry", role == .host { hostRestart(force: false) }
+                return
+            }
             call?.handleSignal(payload)
         case .peerLeft:
             partnerLeft()
@@ -299,11 +314,99 @@ public final class Party: ObservableObject {
         call.announceChannels()
     }
 
+    // MARK: Trying again in the same room
+
+    /// "Try again": sets the call up afresh in the same room, with the same
+    /// roles and new connection attempts on both sides. Works while
+    /// connecting, after a failed attempt and after a drop.
+    public func retryConnection() {
+        guard call != nil || reconnecting || phase == .connecting else { return }
+        if role == .host {
+            hostRestart(force: true)
+        } else {
+            // The host makes the offer; ask for a new one.
+            armConnectTimeout()
+            signaling.signal(["kind": "retry"])
+        }
+    }
+
+    private func hostRestart(force: Bool) {
+        // Both sides usually notice a drop; one restart is enough.
+        guard role == .host, force || Date().timeIntervalSince(lastRestart) > 3 else { return }
+        lastRestart = Date()
+        signaling.signal(["kind": "restart"])
+        restartCall()
+        call?.makeOffer()
+    }
+
+    /// A new call (new peer connection, new ICE) in place of the current one.
+    private func restartCall() {
+        reconnects += 1
+        if phase == .together { holdForReconnect() } else { phase = .connecting }
+        armConnectTimeout()
+        startCall()
+    }
+
+    /// While the call is being set up again nobody misses anything: the film waits.
+    private func holdForReconnect() {
+        guard !reconnecting else { return }
+        reconnecting = true
+        Log.debug("\(role) connection lost; reconnecting")
+        playback.remoteBuffering(true, at: playback.currentTime)
+    }
+
+    /// The call was up and is not any more.
+    private func connectionDropped() {
+        guard !reconnecting else { return }
+        holdForReconnect()
+        armConnectTimeout()
+        // A short interruption often heals by itself; otherwise set the call up again.
+        dropGrace?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.reconnecting else { return }
+            if self.role == .host { self.hostRestart(force: false) } else { self.signaling.signal(["kind": "retry"]) }
+        }
+        dropGrace = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: item)
+    }
+
+    private func connectionRestored() {
+        dropGrace?.cancel()
+        guard reconnecting else { return }
+        reconnecting = false
+        Log.debug("\(role) reconnected")
+        guard role == .host else {
+            playback.remoteBuffering(false, at: playback.currentTime)
+            return
+        }
+        // The two sides rarely notice a drop at the same moment. The host
+        // waits for the guest to say where its film stopped (the first thing
+        // a guest sends on a new control channel) and restarts from the
+        // earlier of the two positions.
+        awaitingPartnerPosition = true
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.awaitingPartnerPosition else { return }
+            self.awaitingPartnerPosition = false
+            self.playback.remoteBuffering(false, at: self.playback.currentTime)
+        }
+        partnerPositionTimeout = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: item)
+    }
+
+    private var awaitingPartnerPosition = false
+    private var partnerPositionTimeout: DispatchWorkItem?
+
+    /// Test hook: the peer connection goes away without a goodbye, as when a network disappears.
+    public func dropConnectionForTesting() {
+        call?.close()
+        connectionDropped()
+    }
+
     private func armConnectTimeout() {
         connectionFailed = false
         connectTimeout?.cancel()
         let item = DispatchWorkItem { [weak self] in
-            guard let self, self.phase == .connecting else { return }
+            guard let self, self.phase == .connecting || self.reconnecting else { return }
             self.failConnection()
         }
         connectTimeout = item
@@ -331,6 +434,11 @@ public final class Party: ObservableObject {
     }
 
     private func partnerLeft() {
+        dropGrace?.cancel()
+        partnerPositionTimeout?.cancel()
+        awaitingPartnerPosition = false
+        reconnecting = false
+        connectionFailed = false
         teardownCall()
         playback.resetRemote()
         if role == .host, let code {
@@ -381,7 +489,15 @@ public final class Party: ObservableObject {
         case .heartbeat(let timeline, let actual):
             playback.receiveHeartbeat(timeline, actual: actual)
         case .buffering(let buffering, let position):
-            playback.remoteBuffering(buffering, at: position)
+            if awaitingPartnerPosition {
+                awaitingPartnerPosition = false
+                partnerPositionTimeout?.cancel()
+                playback.partnerStopped(at: position)
+                // Still loading on their side: stay held until they say otherwise.
+                if !buffering { playback.remoteBuffering(false, at: position) }
+            } else {
+                playback.remoteBuffering(buffering, at: position)
+            }
         case .ping(let t0):
             control?.send(.pong(t0: t0, t1: playback.localNow()))
         case .pong(let t0, let t1):
@@ -457,12 +573,18 @@ extension Party: CallSessionDelegate {
         guard call === self.call else { return }
         if connected {
             connectTimeout?.cancel()
+            connectionFailed = false
             phase = .together
+            connectionRestored()
+        } else if reconnecting {
+            // Still down; the restart and its timeout are already under way.
         } else if phase == .connecting {
             failConnection()
         } else if phase == .together {
-            // The peer connection dropped without a goodbye (network change, sleep).
-            partnerLeft()
+            // The peer connection dropped without a goodbye (network change,
+            // sleep): try to get it back. If the partner has really gone, the
+            // room server says so (peer-left) and that ends it.
+            connectionDropped()
         }
     }
 

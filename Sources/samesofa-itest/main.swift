@@ -35,6 +35,7 @@ if args["audio-check"] != nil {
 // The call's audio threads and the microphone converter, without any hardware.
 if args["device-smoke"] != nil { DeviceSmoke.run(args) }
 if let server = args["connection-test"] { ConnectionTest.run(server: server) }
+if args["receiver-folder-test"] != nil { ReceiverFolderTest.run() }
 if args["display-mode-test"] != nil { DisplayModeTest.run(switchForReal: args["switch"] != nil) }
 if args["audio-thread-test"] != nil { AudioThreadTests.runThreadTest() }
 if let film = args["audio-engine-test"] {
@@ -207,6 +208,62 @@ func runSeekScenario() {
     finish()
 }
 
+/// The call drops in the middle of a film without a goodbye, and "Try again" is pressed on each side:
+/// every time the same room must come back, the film must go on, and what had arrived must be kept.
+func runReconnectScenario() {
+    func bothPlaying() -> Bool { host.playback.player.rate > 0 && guest.playback.player.rate > 0 && !host.playback.isHeld && !guest.playback.isHeld }
+    func backTogether(_ what: String, reconnectsBefore: Int) {
+        let t0 = Date()
+        let ok = wait(45) { host.phase == .together && guest.phase == .together && !host.reconnecting && !guest.reconnecting && host.reconnects > reconnectsBefore }
+        check("\(what): connected again in the same room", ok, String(format: "%.1f s, host set the call up %d time(s)", Date().timeIntervalSince(t0), host.reconnects - reconnectsBefore))
+        check("\(what): the film plays on both sides again", wait(25) { bothPlaying() })
+        spin(3)
+        check("\(what): in sync", drift() < 0.25, String(format: "%.3f s apart", drift()))
+        guest.playback.pause()
+        check("\(what): pause from the guest reaches the host", wait(5) { host.playback.player.rate == 0 && guest.playback.player.rate == 0 })
+        host.playback.play()
+        check("\(what): play from the host reaches the guest", wait(10) { bothPlaying() })
+    }
+    host.playback.play()
+    check("playing before the drop", wait(25) { bothPlaying() })
+    spin(3)
+    let fraction = guest.receiver?.fraction ?? 0, position = host.playback.currentTime, code = host.code
+    var before = host.reconnects
+    guest.dropConnectionForTesting()
+    check("connection drops: both sides say so", wait(30) { host.reconnecting && guest.reconnecting })
+    check("connection drops: the film waits", wait(5) { host.playback.player.rate == 0 && guest.playback.player.rate == 0 })
+    let hostStopped = host.playback.currentTime, guestStopped = guest.playback.currentTime
+    var resumedAt = -1.0
+    let resumed = wait(45) {
+        guard host.playback.player.rate > 0, guest.playback.player.rate > 0 else { return false }
+        resumedAt = host.playback.currentTime
+        return true
+    }
+    // The guest's side went first, so the host played on for a few seconds: both go back to where the guest stopped.
+    check("after a drop: both resume from where the first one stopped", resumed && resumedAt < min(hostStopped, guestStopped) + 1.5 && resumedAt > min(hostStopped, guestStopped) - 1.5,
+          String(format: "guest stopped at %.1f s, host at %.1f s, resumed at %.1f s", guestStopped, hostStopped, resumedAt))
+    backTogether("after a drop", reconnectsBefore: before)
+    check("after a drop: same room, received part kept", host.code == code && (guest.receiver?.fraction ?? 0) >= fraction,
+          String(format: "received %.0f%% (was %.0f%%), film position before the drop %.1f s", (guest.receiver?.fraction ?? 0) * 100, fraction * 100, position))
+    before = host.reconnects
+    guest.retryConnection()
+    backTogether("Try again on the guest", reconnectsBefore: before)
+    before = host.reconnects
+    host.retryConnection()
+    backTogether("Try again on the host", reconnectsBefore: before)
+    before = host.reconnects
+    host.dropConnectionForTesting()
+    backTogether("after a drop on the host's side", reconnectsBefore: before)
+    check("transfer completes", wait(400) { guest.receiver?.isComplete == true }, String(format: "%.0f%%", (guest.receiver?.fraction ?? 0) * 100))
+    if let receiver = guest.receiver {
+        let a = sha256(filmURL), b = sha256(receiver.cacheURL)
+        check("received file is byte-identical", a == b, "sha256 \(a.prefix(16))")
+    }
+    guest.leave()
+    host.leave()
+    finish()
+}
+
 func finish() -> Never {
     let passed = results.filter { $0.1 }.count
     log("SUMMARY \(passed)/\(results.count) checks passed")
@@ -289,6 +346,7 @@ check("clock sync found the skew", wait(5) { abs(guest.playback.clockOffset + sk
 
 if args["control-latency"] != nil { runControlLatency() }
 if args["seek-test"] != nil { runSeekScenario() }
+if args["reconnect-test"] != nil { runReconnectScenario() }
 if throttled { runBufferingScenario() }
 
 func positions() -> (Double, Double) { (host.playback.currentTime, guest.playback.currentTime) }

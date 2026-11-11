@@ -101,10 +101,32 @@ struct PartyView: View {
                     Text("Couldn't connect directly").font(.title2)
                     Text("This usually means one of your networks blocks it. A relay server fixes that (Settings ▸ Connection).")
                         .multilineTextAlignment(.center).frame(maxWidth: 360)
-                    Button("Try again") { model.leaveParty() }.buttonStyle(.borderedProminent)
+                    HStack(spacing: 12) {
+                        Button("Leave") { model.leaveParty() }
+                        Button("Try again") { party.retryConnection() }.buttonStyle(.borderedProminent)
+                            .accessibilityHint("Connects again in the same room")
+                    }
                 } else {
                     ProgressView().controlSize(.large)
                     Text("Connecting…").font(.title2)
+                }
+            }
+        case .together where party.reconnecting:
+            StatusCard {
+                if party.connectionFailed {
+                    Text("Couldn't reconnect").font(.title2)
+                    Text("Check the internet connection on both Macs, then try again. The film stays where it was, and what has already arrived is kept.")
+                        .multilineTextAlignment(.center).frame(maxWidth: 380)
+                } else {
+                    ProgressView().controlSize(.large).accessibilityHidden(true)
+                    Text("Connection lost").font(.title2)
+                    Text("Trying to reconnect… The film waits, and what has already arrived is kept.")
+                        .multilineTextAlignment(.center).frame(maxWidth: 380)
+                }
+                HStack(spacing: 12) {
+                    Button("Leave") { model.leaveParty() }
+                    Button("Try again") { party.retryConnection() }.buttonStyle(.borderedProminent)
+                        .accessibilityHint("Connects again in the same room")
                 }
             }
         case .together:

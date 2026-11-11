@@ -152,6 +152,15 @@ public struct SyncEngine: Sendable {
         return next(playing: true, position: timeline.position, anchor: now + startLead)
     }
 
+    /// While held: the other side's film stopped earlier than ours (its
+    /// connection went first). The restart then happens from there, so that
+    /// nobody misses anything.
+    public mutating func lowerHeldPosition(to position: Double) {
+        guard isHeld, position < timeline.position else { return }
+        timeline = Timeline(playing: true, position: max(0, position), anchor: .greatestFiniteMagnitude,
+                            seq: timeline.seq, origin: timeline.origin)
+    }
+
     /// Position the player should show at `now` (frozen while held).
     public func targetPosition(at now: Double) -> Double {
         if isHeld { return timeline.position }

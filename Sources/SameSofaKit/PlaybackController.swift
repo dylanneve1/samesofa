@@ -262,6 +262,13 @@ public final class PlaybackController: ObservableObject {
         apply()
     }
 
+    /// After a reconnect: the partner's film stopped at `position`. If that
+    /// is earlier than where this side stopped, the restart is from there.
+    func partnerStopped(at position: Double) {
+        engine.lowerHeldPosition(to: position)
+        apply()
+    }
+
     /// Clears hold state, e.g. when the other person leaves.
     func resetRemote() {
         _ = engine.setRemoteBuffering(false, now: sharedNow, actualPosition: currentTime)
