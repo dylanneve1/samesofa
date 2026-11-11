@@ -254,4 +254,16 @@ final class SyncTests: XCTestCase {
         XCTAssertTrue(guest.receive(restart))
         XCTAssertTrue(guest.effectivePlaying)
     }
+
+    func testSchedulerJumpDropsOldPositionAndFetchesTargetFirst() {
+        var s = ChunkScheduler(map: ChunkMap(fileSize: 1000 * 65536, chunkSize: 65536), window: 24)
+        _ = s.nextRequests() // filling from chunk 0
+        s.prioritize(offset: 900 * 65536, length: 4 * 65536)
+        XCTAssertTrue(s.urgentIsJump)
+        s.resetInFlight()
+        XCTAssertEqual(Array(s.nextRequests().prefix(4)), [900, 901, 902, 903])
+        // A request right next to what is in flight is not a jump.
+        s.prioritize(offset: 910 * 65536, length: 65536)
+        XCTAssertFalse(s.urgentIsJump)
+    }
 }
