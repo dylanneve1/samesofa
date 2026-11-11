@@ -89,7 +89,7 @@ struct RootView: View {
 extension LaunchOptions {
     /// Started by a script or test (command-line switches), not by a person.
     var isScripted: Bool {
-        server != nil || hostFilm != nil || joinCode != nil || synthetic || screen != nil || typeTest != nil || show != nil
+        server != nil || hostFilm != nil || joinCode != nil || synthetic || screen != nil || typeTest != nil || show != nil || testConnectionOutput != nil
     }
 }
 

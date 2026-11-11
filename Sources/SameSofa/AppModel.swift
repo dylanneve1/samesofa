@@ -216,7 +216,7 @@ final class AppModel: ObservableObject {
             do {
                 try party.host(film: film, check: check)
             } catch {
-                self.notice = "Couldn't open that file: \(error.localizedDescription)"
+                self.notice = "Couldn't open that file (\(error.localizedDescription)). Check that it is still where it was, or pick another film."
                 return
             }
             self.attach(party)

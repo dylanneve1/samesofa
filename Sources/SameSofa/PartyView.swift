@@ -534,24 +534,50 @@ struct QualityView: View {
         let display = displayLine
         VStack(alignment: .leading, spacing: 14) {
             Text("Playback quality").font(.headline)
-            row("Picture", playback.quality.video ?? "No picture", origin(party.sharedFilm?.videoConverted))
-            row("Sound", playback.quality.audio ?? "No sound", origin(party.sharedFilm?.audioConverted))
+            if playback.isLoaded {
+                row("Picture", playback.quality.video ?? "This film has no picture", playback.quality.video == nil ? "" : origin(party.sharedFilm?.videoConverted))
+                row("Sound", playback.quality.audio ?? "This film has no sound", playback.quality.audio == nil ? "" : origin(party.sharedFilm?.audioConverted))
+            } else {
+                row("Film", "Not loaded yet", party.role == .host ? "The details appear as soon as the film is ready on this Mac."
+                    : "The details appear as soon as the first part of the film has arrived.")
+            }
             row("Film sound path", playback.systemSpatialAudio ? "Straight to the sound output, with the system's spatial audio" : "Straight to the sound output, no processing",
                 "The film is never routed through the call or the microphone clean-up.")
             if hub.mode == .live {
                 row("Output", "\(hub.outputRoute.name) (\(hub.outputRoute.kind == .headphones ? "headphones" : "speakers"))", "")
-                row("Microphone", party.phase != .together ? "Not in use (no call)"
-                        : !party.micOn ? "Muted"
-                        : hub.cancelsFilmEcho ? "Echo cancellation removes the film and your partner's voice"
-                        : "Echo cancellation removes your partner's voice",
-                    party.phase == .together && party.micOn && !hub.cancelsFilmEcho
-                        ? (playback.systemSpatialAudio ? "With the system's spatial audio the film can't be removed from the microphone: use headphones."
-                           : "Headphones: the microphone doesn't hear the film.") : "")
+                if party.phase == .together, let trouble = Self.microphoneTrouble(hub) {
+                    row("Microphone", trouble.0, trouble.1)
+                } else {
+                    row("Microphone", party.phase != .together ? "Not in use (no call)"
+                            : !party.micOn ? "Muted"
+                            : hub.cancelsFilmEcho ? "Echo cancellation removes the film and your partner's voice"
+                            : "Echo cancellation removes your partner's voice",
+                        party.phase == .together && party.micOn && !hub.cancelsFilmEcho
+                            ? (playback.systemSpatialAudio ? "With the system's spatial audio the film can't be removed from the microphone: use headphones."
+                               : "Headphones: the microphone doesn't hear the film.") : "")
+                }
             }
             row("Display", display.0, display.1)
         }
         .padding(18)
         .frame(width: 430, alignment: .leading)
+    }
+
+    /// Why your partner can't hear you, and what to do about it (nil: the microphone works).
+    static func microphoneTrouble(_ hub: AudioHub) -> (String, String)? {
+        if let error = hub.engineError {
+            return ("The call's sound is restarting", "SameSofa keeps trying by itself (\(error)). If it stays like this, check the sound output in System Settings ▸ Sound.")
+        }
+        switch hub.microphoneState {
+        case .working, .notStarted:
+            return nil
+        case .noDevice:
+            return ("No microphone found", "Your partner can't hear you. Connect a microphone or headset; SameSofa picks it up within a couple of seconds.")
+        case .accessDenied:
+            return ("macOS isn't letting SameSofa use the microphone", "Your partner can't hear you. Allow it in System Settings ▸ Privacy & Security ▸ Microphone, then leave and join again.")
+        case .unusable(let reason):
+            return ("This microphone can't be used", "Your partner can't hear you (\(reason)). Choose another microphone in System Settings ▸ Sound ▸ Input, or unplug this one and plug it back in.")
+        }
     }
 
     private func row(_ title: String, _ value: String, _ detail: String) -> some View {
@@ -560,6 +586,10 @@ struct QualityView: View {
             Text(value).font(.callout.monospacedDigit()).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
             if !detail.isEmpty { Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
         }
+        // One row, one thing to hear: "Picture: H.264 ...".
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(title): \(value)" + (detail.isEmpty ? "" : ". \(detail)"))
+        .accessibilityAddTraits(.isStaticText)
     }
 }
 
@@ -569,8 +599,10 @@ struct VolumeControl: View {
     let help: String
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: icon).font(.system(size: 14)).foregroundStyle(.white.opacity(0.8)).frame(width: 20)
+            Image(systemName: icon).font(.system(size: 14)).foregroundStyle(.white.opacity(0.8)).frame(width: 20).accessibilityHidden(true)
             Slider(value: $value, in: 0...1).frame(width: 84).tint(Theme.accent).controlSize(.small)
+                .accessibilityLabel(help)
+                .accessibilityValue("\(Int((value * 100).rounded())) percent")
         }
         .help(help)
     }

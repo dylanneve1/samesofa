@@ -575,7 +575,11 @@ scripts/                  build.sh, fetch-webrtc.sh, build-apm.sh, build-ffmpeg.
   (ProMotion, adaptive sync) macOS can follow it, on a display fixed at 60 Hz a
   24 fps film still alternates between two and three refreshes per frame. The
   build machine's display is fixed at 60 Hz, so the effect on a ProMotion
-  display is untested. SameSofa does not switch display modes.
+  display is untested. For displays with a fixed refresh rate that offer
+  others at the same resolution, *Settings ▸ Video ▸ Match display to film in
+  full screen* switches the display mode in full screen and back; the build
+  machine's display has a single mode, so a real switch is untested (the
+  choice of mode is unit-tested with mode lists of TVs and monitors).
 - Real Dolby Atmos (E-AC-3 JOC) content was not available for testing.
 - The timestamp repair handles the plain form of the defect (presentation time
   equal to decode time); other kinds of damaged timing fall back to

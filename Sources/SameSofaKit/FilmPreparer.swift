@@ -97,13 +97,13 @@ public final class FilmPreparer {
             probe = try await Self.probe(film, tools: tools)
         } catch {
             if playable && sidecar == nil { return .shareAsIs }
-            throw FilmPreparerError("That file doesn't look like a film SameSofa can read.")
+            throw FilmPreparerError("That file doesn't look like a film SameSofa can read. Pick the film file itself (MP4, MOV, MKV, AVI and similar), or try another copy of it.")
         }
         var plan: ConversionPlan
         do {
             plan = try MediaPlanner.plan(probe, sidecarSubtitles: sidecar?.path)
         } catch {
-            throw FilmPreparerError("That file has no picture or sound SameSofa can find.")
+            throw FilmPreparerError("That file has no picture or sound SameSofa can find. Try another copy of the film.")
         }
         // B-frames without reordering information (or other scrambled
         // presentation times) play out of order in AVFoundation.
@@ -415,7 +415,7 @@ public final class FilmPreparer {
                                     self.start(completion: completion)
                                 } else {
                                     self.discardOutput()
-                                    completion(.failure(FilmPreparerError("This file's timing information is damaged and couldn't be repaired.")))
+                                    completion(.failure(FilmPreparerError("This file's timing information is damaged and couldn't be repaired. Try another copy of the film.")))
                                 }
                             }
                         }
@@ -423,7 +423,7 @@ public final class FilmPreparer {
                         Log.debug("ffmpeg failed (\(status)): \(message)")
                         self.discardOutput()
                         let last = message.split(separator: "\n").last.map(String.init) ?? "exit code \(status)"
-                        completion(.failure(FilmPreparerError("Couldn't convert the film (\(last)).")))
+                        completion(.failure(FilmPreparerError("Couldn't convert the film (\(last)). Try another copy of it, or an MP4 or MOV version.")))
                     }
                 }
             }

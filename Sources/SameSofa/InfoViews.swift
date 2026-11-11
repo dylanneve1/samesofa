@@ -66,7 +66,7 @@ struct AboutView: View {
 
     var body: some View {
         VStack(spacing: 14) {
-            Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 96, height: 96)
+            Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 96, height: 96).accessibilityHidden(true)
             Text("SameSofa").font(.system(size: 28, weight: .bold, design: .rounded))
             Text("Version \(AppInfo.version)" + (AppInfo.build.isEmpty ? "" : " (\(AppInfo.build))"))
                 .font(.callout.monospacedDigit()).foregroundStyle(Theme.secondaryText).textSelection(.enabled)
@@ -79,11 +79,14 @@ struct AboutView: View {
                 if let url = AppInfo.projectURL {
                     Link(destination: url) { Label("Source code", systemImage: "chevron.left.forwardslash.chevron.right").frame(height: 30).padding(.horizontal, 12) }
                         .buttonStyle(SoftButtonStyle())
+                        .accessibilityHint("Opens the project's page in your browser")
                 }
                 Button { showDisclaimer = true } label: { Label("Disclaimer", systemImage: "doc.text").frame(height: 30).padding(.horizontal, 12) }
                     .buttonStyle(SoftButtonStyle())
+                    .accessibilityHint("Shows the full text")
                 Button { openWindow(id: "acknowledgements") } label: { Label("Acknowledgements", systemImage: "heart").frame(height: 30).padding(.horizontal, 12) }
                     .buttonStyle(SoftButtonStyle())
+                    .accessibilityHint("Opens the list of projects SameSofa is built on, with their licences")
             }
             .fixedSize()
             .padding(.top, 4)
@@ -112,7 +115,10 @@ struct TextSheet: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(text, forType: .string)
                 }
+                .accessibilityLabel("Copy the text")
+                .accessibilityHint("Puts the whole text of \(title) on the clipboard")
                 Button("Done", action: done).keyboardShortcut(.defaultAction)
+                    .accessibilityHint("Closes this text")
             }
             ScrollView {
                 Text(text)
@@ -197,6 +203,7 @@ struct AcknowledgementsView: View {
                         Label(copied ? "Copied" : "Copy all notices", systemImage: copied ? "checkmark" : "doc.on.doc").frame(height: 30).padding(.horizontal, 12)
                     }
                     .buttonStyle(SoftButtonStyle())
+                    .accessibilityHint("Puts SameSofa's licence and every third-party notice on the clipboard")
                 }
                 ForEach(Self.components) { component in
                     InfoCard {
@@ -211,8 +218,12 @@ struct AcknowledgementsView: View {
                         }
                         HStack(spacing: 16) {
                             Button("View licence") { shown = component }.buttonStyle(.link)
+                                .accessibilityLabel("View the licence of \(component.name)")
+                                .accessibilityHint("Shows the full licence text")
                             if let link = component.link, let url = URL(string: link) {
                                 Link("Project website", destination: url)
+                                    .accessibilityLabel("\(component.name) website")
+                                    .accessibilityHint("Opens in your browser")
                             }
                         }
                         .font(.callout)
@@ -240,6 +251,8 @@ struct ShortcutsView: View {
         ("M", "Mute or unmute your microphone"),
         ("Esc", "Leave full screen"),
     ]
+    /// How VoiceOver should say the keys.
+    static let spoken = ["Space": "Space bar", "←  →": "Left arrow and right arrow", "F": "F", "M": "M", "Esc": "Escape"]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -254,6 +267,9 @@ struct ShortcutsView: View {
                         Text(action)
                         Spacer()
                     }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(Self.spoken[key] ?? key): \(action)")
+                    .accessibilityAddTraits(.isStaticText)
                 }
             }
             Text("They work while a film is open. Play, pause and seeking always apply to both of you.")

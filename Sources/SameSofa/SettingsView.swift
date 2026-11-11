@@ -13,6 +13,7 @@ struct SettingsView: View {
                     Text("Off").tag("speakers")
                 }
                 .pickerStyle(.segmented)
+                .help("Automatic decides from the sound output in use")
                 Text("The film always plays untouched, at full quality. With speakers, SameSofa removes the film and your partner's voice from your microphone so they hear no echo; with headphones that isn't needed. Automatic looks at the sound output in use.")
                     .font(.caption).foregroundStyle(.secondary)
                 Picker("Spatial audio", selection: $settings.systemSpatialAudio) {
@@ -20,12 +21,14 @@ struct SettingsView: View {
                     Text("System").tag(true)
                 }
                 .pickerStyle(.segmented)
+                .help("Takes effect with the next film")
                 Text("Off plays surround films as a plain, level-true downmix. System leaves Dolby Atmos and spatial audio to macOS; the film then can't be removed from your microphone, so use it with headphones. Takes effect with the next film.")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Audio") }
 
             Section {
                 Toggle("Match the display to the film's frame rate", isOn: $settings.matchFrameRate)
+                    .help("For displays with a variable refresh rate")
                 Text("On displays with a variable refresh rate (ProMotion, adaptive sync), every film frame is shown for the same time.")
                     .font(.caption).foregroundStyle(.secondary)
                 Picker("Match display to film in full screen", selection: $settings.displayMatch) {
@@ -33,6 +36,7 @@ struct SettingsView: View {
                     Text("Off").tag("off")
                 }
                 .pickerStyle(.segmented)
+                .help("Automatic switches a fixed-rate display in full screen and back again")
                 Text("For displays with a fixed refresh rate, such as most TVs and monitors. A 24 fps film can't be shown evenly at 60 Hz. In full screen, Automatic switches the display to a rate that suits the film (24 or 120 Hz, say) if it offers one at the same resolution, and switches back when you leave full screen. The screen may go black for a moment while it changes.")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Video") }
@@ -40,6 +44,7 @@ struct SettingsView: View {
             Section {
                 TextField("Server address", text: $settings.serverURL, prompt: Text(AppSettings.placeholderServer))
                     .textFieldStyle(.roundedBorder)
+                    .help("Looks like wss://sofa.example.org. Both of you need the same one.")
                 Text("The small room server that lets two copies of SameSofa find each other. Both of you need the same address. It never sees your film, voice or video.")
                     .font(.caption).foregroundStyle(.secondary)
                 ConnectionTestRow()
@@ -48,12 +53,16 @@ struct SettingsView: View {
             Section {
                 TextField("STUN servers (comma separated)", text: $settings.stunURLs)
                     .textFieldStyle(.roundedBorder)
+                    .help("Servers that tell each Mac its public address. The default ones are fine.")
                 TextField("TURN server (e.g. turn:turn.example.org:3478)", text: $settings.turnURL)
                     .textFieldStyle(.roundedBorder)
+                    .help("A relay for networks that block direct connections. Starts with turn: or turns:")
                 TextField("TURN username", text: $settings.turnUsername)
                     .textFieldStyle(.roundedBorder)
+                    .help("The user name for the TURN server above")
                 SecureField("TURN password", text: $settings.turnCredential)
                     .textFieldStyle(.roundedBorder)
+                    .help("The password for the TURN server above")
                 Text("Only needed if the two of you can't connect directly (some office, hotel or mobile networks). A TURN server relays the encrypted connection."
                      + (AppSettings.builtInRelay != nil ? " This copy of SameSofa comes with a relay; it is used while the TURN server field is empty." : ""))
                     .font(.caption).foregroundStyle(.secondary)
@@ -110,6 +119,7 @@ struct ConnectionTestRow: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel((line.ok ? "Passed. " : "Failed. ") + line.text)
+        .accessibilityAddTraits(.isStaticText)
     }
 
     private func run() {

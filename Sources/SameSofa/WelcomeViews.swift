@@ -8,6 +8,7 @@ struct Wordmark: View {
             Image(systemName: "sofa.fill")
                 .font(.system(size: 44, weight: .regular))
                 .foregroundStyle(Theme.accent)
+                .accessibilityHidden(true)
             Text("SameSofa")
                 .font(.system(size: 40, weight: .bold, design: .rounded))
             Text("Watch a film together, wherever you are.")
@@ -37,7 +38,7 @@ struct WelcomeView: View {
             }
             if model.inspecting {
                 HStack(spacing: 10) {
-                    ProgressView().controlSize(.small)
+                    ProgressView().controlSize(.small).accessibilityHidden(true)
                     Text("Looking at the film…").foregroundStyle(Theme.secondaryText)
                 }
             }
@@ -99,6 +100,8 @@ struct BigChoice: View {
         }
         .buttonStyle(.plain)
         .onHover { h in withAnimation(.easeOut(duration: 0.15)) { hovering = h } }
+        .accessibilityLabel(title)
+        .accessibilityHint(subtitle)
     }
 }
 
@@ -106,9 +109,10 @@ struct NoticeView: View {
     let text: String
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(Theme.accent)
+            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(Theme.accent).accessibilityHidden(true)
             Text(text).fixedSize(horizontal: false, vertical: true)
         }
+        .accessibilityElement(children: .combine)
         .font(.body)
         .padding(.horizontal, 18).padding(.vertical, 12)
         .frame(maxWidth: 560)
@@ -134,12 +138,14 @@ struct JoinView: View {
             ZStack {
                 CodeKeyCatcher(code: $code, onSubmit: submit)
                     .frame(width: 1, height: 1)
+                // VoiceOver reads the code as one text field (CodeKeyCatcher), not as six loose letters.
                 HStack(spacing: 12) {
                     ForEach(0..<RoomCode.length, id: \.self) { i in
                         CodeBox(character: character(at: i), active: i == min(code.count, RoomCode.length - 1))
                         if i == RoomCode.length / 2 - 1 { Spacer().frame(width: 14) }
                     }
                 }
+                .accessibilityHidden(true)
             }
             .onChange(of: code) { _, newValue in
                 if newValue.count == RoomCode.length {
@@ -157,6 +163,7 @@ struct JoinView: View {
                     Text("Back").frame(width: 110, height: 40)
                 }
                 .buttonStyle(SoftButtonStyle())
+                .accessibilityHint("Back to the first screen")
                 Button {
                     submit()
                 } label: {
@@ -164,6 +171,7 @@ struct JoinView: View {
                 }
                 .buttonStyle(AccentButtonStyle())
                 .disabled(code.count != RoomCode.length)
+                .accessibilityHint(code.count == RoomCode.length ? "Joins your partner's room" : "Type all six characters of the code first")
             }
             Spacer()
         }
@@ -242,6 +250,22 @@ struct CodeKeyCatcher: NSViewRepresentable {
 
         override var acceptsFirstResponder: Bool { true }
 
+        // To VoiceOver this is the text field the six boxes stand for.
+        override func isAccessibilityElement() -> Bool { true }
+        override func accessibilityRole() -> NSAccessibility.Role? { .textField }
+        override func accessibilityLabel() -> String? { "Room code" }
+        override func accessibilityHelp() -> String? {
+            "Six letters and digits your partner reads out from their screen. Type them; SameSofa joins after the sixth."
+        }
+        /// Spelled out, so it is read letter by letter.
+        override func accessibilityValue() -> Any? { current.map(String.init).joined(separator: " ") }
+        override func setAccessibilityValue(_ value: Any?) {
+            guard let text = value as? String else { return }
+            current = RoomCode.sanitizeTyping(text)
+            onChange?(current)
+        }
+        override func isAccessibilityEnabled() -> Bool { true }
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             DispatchQueue.main.async { self.window?.makeFirstResponder(self) }
@@ -260,6 +284,7 @@ struct CodeKeyCatcher: NSViewRepresentable {
                 let next = RoomCode.sanitizeTyping(current + typed)
                 if next != current { current = next; onChange?(current) } else { NSSound.beep() }
             }
+            NSAccessibility.post(element: self, notification: .valueChanged)
         }
 
         override func performKeyEquivalent(with event: NSEvent) -> Bool {
