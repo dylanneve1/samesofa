@@ -27,6 +27,8 @@ final class AppSettings: ObservableObject {
     @Published var systemSpatialAudio: Bool { didSet { defaults.set(systemSpatialAudio, forKey: "systemSpatialAudio") } }
     /// Ask variable-refresh displays to follow the film's frame rate.
     @Published var matchFrameRate: Bool { didSet { defaults.set(matchFrameRate, forKey: "matchFrameRate") } }
+    /// "automatic" or "off": in full screen, switch a fixed-rate display to a refresh rate that suits the film.
+    @Published var displayMatch: String { didSet { defaults.set(displayMatch, forKey: "displayMatch") } }
 
     var echoSetting: EchoSetting { EchoSetting(rawValue: soundOutput) ?? .automatic }
 
@@ -39,6 +41,7 @@ final class AppSettings: ObservableObject {
         soundOutput = defaults.string(forKey: "soundOutput") ?? EchoSetting.automatic.rawValue
         systemSpatialAudio = defaults.bool(forKey: "systemSpatialAudio")
         matchFrameRate = defaults.object(forKey: "matchFrameRate") as? Bool ?? true
+        displayMatch = defaults.string(forKey: "displayMatch") ?? "automatic"
         // A command-line override is handy for testing two copies on one Mac.
         if let override = LaunchOptions.shared.server { serverURL = override }
     }
@@ -79,6 +82,8 @@ struct LaunchOptions {
     /// window (not the system), and record what code the app tried to join.
     var typeTest: String?
     var typeTestOutput: URL?
+    /// Scripted runs never change the display's refresh rate unless this is given.
+    var allowDisplayMatch = false
 
     init() {
         var args = ArraySlice(CommandLine.arguments.dropFirst())
@@ -98,6 +103,7 @@ struct LaunchOptions {
             case "--prefill": prefill = args.popFirst()
             case "--type-test": typeTest = args.popFirst()
             case "--type-test-output": typeTestOutput = args.popFirst().map { URL(fileURLWithPath: $0) }
+            case "--allow-display-match": allowDisplayMatch = true
             default: break
             }
         }
@@ -133,6 +139,7 @@ final class AppModel: ObservableObject {
         settings.$soundOutput.sink { [weak self] value in
             self?.party?.hub.echoSetting = EchoSetting(rawValue: value) ?? .automatic
         }.store(in: &cancellables)
+        DisplayMatcher.shared.start(model: self)
         DispatchQueue.main.async { self.runLaunchOptions() }
     }
 

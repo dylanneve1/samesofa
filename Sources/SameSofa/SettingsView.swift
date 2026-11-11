@@ -25,7 +25,14 @@ struct SettingsView: View {
 
             Section {
                 Toggle("Match the display to the film's frame rate", isOn: $settings.matchFrameRate)
-                Text("On displays with a variable refresh rate (ProMotion, adaptive sync), every film frame is shown for the same time. Displays fixed at 60 Hz can't do this for 24 fps films.")
+                Text("On displays with a variable refresh rate (ProMotion, adaptive sync), every film frame is shown for the same time.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Picker("Match display to film in full screen", selection: $settings.displayMatch) {
+                    Text("Automatic").tag("automatic")
+                    Text("Off").tag("off")
+                }
+                .pickerStyle(.segmented)
+                Text("For displays with a fixed refresh rate, such as most TVs and monitors. A 24 fps film can't be shown evenly at 60 Hz. In full screen, Automatic switches the display to a rate that suits the film (24 or 120 Hz, say) if it offers one at the same resolution, and switches back when you leave full screen. The screen may go black for a moment while it changes.")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Video") }
 

@@ -521,16 +521,12 @@ struct QualityView: View {
         }
     }
 
+    @AppStorage("displayMatch") private var displayMatch = "automatic"
+    @ObservedObject private var displayMatcher = DisplayMatcher.shared
+
     private var displayLine: (String, String) {
-        guard let screen = NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain })?.screen ?? NSScreen.main else { return ("Unknown", "") }
-        let top = Double(screen.maximumFramesPerSecond)
-        let variable = screen.maximumRefreshInterval > screen.minimumRefreshInterval * 1.05
-        let name = "\(screen.localizedName.isEmpty ? "This display" : screen.localizedName) · \(Int(top.rounded())) Hz" + (variable ? ", variable" : "")
-        let fps = playback.frameRate
-        guard fps >= 1 else { return (name, "") }
-        if variable { return (name, "Can follow the film's frame rate, so every frame is shown for the same time.") }
-        if FrameRateMatch.isEvenCadence(filmFrameRate: fps, refreshRate: top) { return (name, "Every film frame is shown for the same time.") }
-        return (name, String(format: "Fixed at %.0f Hz: a %.2f fps film can't be shown evenly, so motion may judder slightly. A display setting of ProMotion, or a multiple of the film's frame rate, avoids that.", top, fps))
+        let line = displayMatcher.readout(filmFrameRate: playback.frameRate, settingOn: displayMatch != "off")
+        return (line.title, line.detail)
     }
 
     var body: some View {
