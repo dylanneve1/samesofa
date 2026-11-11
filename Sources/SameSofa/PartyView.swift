@@ -699,6 +699,7 @@ struct UpNextView: View {
                 Button("Play next now") { party.playNext() }
                     .disabled(party.queue.isEmpty || !party.canChangeFilm)
             }
+            .controlSize(.large)
             .padding(.top, 4)
         }
         .padding(18)

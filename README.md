@@ -42,6 +42,7 @@ sync, with the call in a little floating bubble over the film.
 | ![Welcome: join, start a room, or host a film](docs/screenshots/welcome.png) | ![Typing the code](docs/screenshots/join.png) |
 | ![A room without a film: your partner fills the window](docs/screenshots/hangout.png) | ![The guest while the host picks another film](docs/screenshots/choosing.png) |
 | ![The host's code](docs/screenshots/host-waiting.png) | ![Playing, controls hidden](docs/screenshots/playing.png) |
+| ![Up next: the card both see when a film ends](docs/screenshots/up-next.png) | |
 
 | | |
 |---|---|
