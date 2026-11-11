@@ -151,6 +151,50 @@ func runControlLatency() {
     finish()
 }
 
+/// Seeks into film the guest does not have yet (throttled link): time until both play again.
+func runSeekScenario() {
+    let dur = host.playback.duration
+    let size = Double((try? FileManager.default.attributesOfItem(atPath: filmURL.path)[.size] as? NSNumber)??.int64Value ?? 0)
+    let rate = Double(args["throttle"] ?? "0") ?? 0
+    func bothPlaying() -> Bool { host.playback.player.rate > 0 && guest.playback.player.rate > 0 && !host.playback.isHeld && !guest.playback.isHeld }
+    func jump(_ frac: Double, from: Party, label: String, maxWait: Double) -> Double {
+        let t0 = Date()
+        from.playback.seek(to: dur * frac)
+        from.playback.play()
+        let ok = wait(maxWait) { bothPlaying() && abs(guest.playback.currentTime - dur * frac) < 20 }
+        let took = Date().timeIntervalSince(t0)
+        let expected = rate > 0 ? (size / dur * 8) / rate : 0
+        check("seek \(label): both playing again", ok, String(format: "%.1f s (8 s of film = %.1f s of link)", took, expected))
+        return took
+    }
+    host.playback.play()
+    spin(2)
+    _ = jump(0.5, from: host, label: "host to 50%", maxWait: 90)
+    _ = jump(0.9, from: guest, label: "guest to 90%", maxWait: 90)
+    // Scrub: ten quick seeks; only the last matters.
+    let t0 = Date()
+    for i in 0..<10 { host.playback.seek(to: dur * (0.1 + 0.05 * Double(i))); spin(0.15) }
+    let final = dur * 0.55
+    host.playback.seek(to: final)
+    host.playback.play()
+    let ok = wait(90) { bothPlaying() && abs(guest.playback.currentTime - final) < 20 }
+    check("scrub through 10 positions: playing at the last one", ok, String(format: "%.1f s", Date().timeIntervalSince(t0)))
+    // Back into data that has already arrived.
+    spin(3)
+    let t1 = Date()
+    host.playback.seek(to: dur * 0.5 + 1)
+    let back = wait(5) { bothPlaying() && abs(guest.playback.currentTime - (dur * 0.5 + 1)) < 3 }
+    check("seek back into received film is quick", back && Date().timeIntervalSince(t1) < 3, String(format: "%.2f s", Date().timeIntervalSince(t1)))
+    check("transfer completes", wait(400) { guest.receiver?.isComplete == true }, String(format: "%.0f%%", (guest.receiver?.fraction ?? 0) * 100))
+    if let receiver = guest.receiver {
+        let a = sha256(filmURL), b = sha256(receiver.cacheURL)
+        check("received file is byte-identical", a == b, "sha256 \(a.prefix(16))")
+    }
+    guest.leave()
+    host.leave()
+    finish()
+}
+
 func finish() -> Never {
     let passed = results.filter { $0.1 }.count
     log("SUMMARY \(passed)/\(results.count) checks passed")
@@ -232,6 +276,7 @@ check("clock sync found the skew", wait(5) { abs(guest.playback.clockOffset + sk
       String(format: "offset %.4f s (true %.4f), best rtt %.1f ms", guest.playback.clockOffset, -skew, guest.clockRoundTrip * 1000))
 
 if args["control-latency"] != nil { runControlLatency() }
+if args["seek-test"] != nil { runSeekScenario() }
 if throttled { runBufferingScenario() }
 
 func positions() -> (Double, Double) { (host.playback.currentTime, guest.playback.currentTime) }
