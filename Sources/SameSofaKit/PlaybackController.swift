@@ -415,7 +415,7 @@ public final class PlaybackController: ObservableObject {
     /// A seek to a place the film hasn't reached yet: show buffering at once (both
     /// sides pause together) and start fetching there, instead of waiting to notice a stall.
     private func holdIfUnbuffered(at target: Double) {
-        guard let hasEnoughAhead, !engine.localBuffering, player.currentItem != nil, !hasEnoughAhead(target) else { return }
+        guard let hasEnoughAhead, !engine.localBuffering, player.currentItem != nil, abs(target - currentTime) > 2, !hasEnoughAhead(target) else { return }
         holdCount += 1
         _ = engine.setLocalBuffering(true, now: sharedNow, actualPosition: target)
         send?(.buffering(true, position: target))
