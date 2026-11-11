@@ -68,6 +68,8 @@ public final class Party: ObservableObject {
     @Published public private(set) var transferLine = ""
     /// ICE failed or timed out while setting up: the view offers "Try again".
     @Published public private(set) var connectionFailed = false
+    /// The partner's SameSofa is older or newer than this one (shown as a note; nothing is blocked).
+    @Published public private(set) var versionNote: String?
     private var connectTimeout: DispatchWorkItem?
     /// The call dropped after it had been up (network change, sleep, a
     /// flaky link) and is being set up again in the same room. The film is
@@ -434,6 +436,7 @@ public final class Party: ObservableObject {
     }
 
     private func partnerLeft() {
+        versionNote = nil
         dropGrace?.cancel()
         partnerPositionTimeout?.cancel()
         awaitingPartnerPosition = false
@@ -474,8 +477,15 @@ public final class Party: ObservableObject {
             Log.debug("\(role) got \(message)")
         }
         switch message {
-        case .hello:
-            break
+        case .hello(_, let version):
+            Log.debug("\(role) partner speaks protocol \(version), this copy \(ControlMessage.protocolVersion)")
+            switch ControlMessage.compatibility(with: version) {
+            case .same: versionNote = nil
+            case .note(let text): versionNote = text
+            case .incompatible(let text):
+                leave()
+                phase = .ended(text)
+            }
         case .fileInfo(let info):
             guard role == .guest, receiver == nil else { return }
             preparing = nil

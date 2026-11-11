@@ -96,7 +96,32 @@ public enum ControlMessage: Codable, Equatable, Sendable {
     case preparing(fraction: Double)
     case bye
 
-    public static let protocolVersion = 1
+    /// 1: SameSofa 1.0 to 1.2.0. 2: 1.2.1 (reconnecting in the same room,
+    /// seeks that drop queued chunks). Versions only add optional things, so
+    /// different versions still work together; they just say so.
+    public static let protocolVersion = 2
+    /// Partners older than this cannot be watched with at all.
+    public static let oldestCompatibleVersion = 1
+
+    /// What to tell the user about a partner announcing `theirs`.
+    public enum Compatibility: Equatable, Sendable {
+        case same
+        /// Works, with a note (non-blocking).
+        case note(String)
+        /// Does not work.
+        case incompatible(String)
+    }
+
+    public static func compatibility(with theirs: Int, ours: Int = protocolVersion, oldest: Int = oldestCompatibleVersion) -> Compatibility {
+        if theirs == ours { return .same }
+        if theirs < oldest {
+            return .incompatible("Your partner's SameSofa is too old to watch together with this one. Ask them to update, then try again.")
+        }
+        if theirs < ours {
+            return .note("Your partner has an older SameSofa. Some things may not work until they update.")
+        }
+        return .note("Your partner has a newer SameSofa. Some things may not work until you update.")
+    }
 
     public func encoded() -> Data {
         // Encoding these value types cannot fail.

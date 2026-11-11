@@ -9,6 +9,7 @@ struct PartyView: View {
     @ObservedObject var playback: PlaybackController
     @EnvironmentObject var settings: AppSettings
     @State private var showQuality = LaunchOptions.shared.show == "quality"
+    @State private var versionNoteDismissed = false
 
     @State private var controlsVisible = true
     @State private var lastActivity = Date()
@@ -182,6 +183,23 @@ struct PartyView: View {
                 .shadow(radius: 4)
             Spacer()
             if case .waitingForPartner(let code) = party.phase { CodeChip(code: code) }
+            if party.phase == .together, let note = party.versionNote, !versionNoteDismissed {
+                // Not in the way of anything: a line in the top bar that goes away on a click.
+                Button { versionNoteDismissed = true } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.circle").accessibilityHidden(true)
+                        Text(note).lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .font(.callout).padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(Capsule().fill(.black.opacity(0.45)))
+                    .overlay(Capsule().stroke(.white.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: 420)
+                .help("Click to hide this note")
+                .accessibilityLabel(note)
+                .accessibilityHint("Hides this note")
+            }
             if party.phase == .together, party.preparing == nil, party.transferFraction < 1, let film = party.sharedFilm {
                 Text(party.transferLine.isEmpty ? TransferText.line(sending: party.role == .host, received: 0, total: film.size, rate: 0) : party.transferLine)
                     .font(.callout).foregroundStyle(.white.opacity(0.75))

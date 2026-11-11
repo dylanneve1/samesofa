@@ -105,3 +105,33 @@ final class NudgeTests: XCTestCase {
         }
     }
 }
+
+final class CompatibilityTests: XCTestCase {
+    func testVersionNotes() {
+        XCTAssertEqual(ControlMessage.compatibility(with: ControlMessage.protocolVersion), .same)
+        XCTAssertEqual(ControlMessage.compatibility(with: 1, ours: 2),
+                       .note("Your partner has an older SameSofa. Some things may not work until they update."))
+        XCTAssertEqual(ControlMessage.compatibility(with: 3, ours: 2),
+                       .note("Your partner has a newer SameSofa. Some things may not work until you update."))
+        guard case .incompatible = ControlMessage.compatibility(with: 1, ours: 5, oldest: 3) else { return XCTFail("too old must block") }
+        // Every version so far can still be watched with.
+        XCTAssertGreaterThanOrEqual(1, ControlMessage.oldestCompatibleVersion)
+    }
+
+    func testHeldPositionCanOnlyMoveBack() {
+        var host = SyncEngine(role: .host)
+        _ = host.play(now: 0)
+        _ = host.setRemoteBuffering(true, now: 10, actualPosition: 9.6)
+        let frozen = host.timeline.position
+        host.lowerHeldPosition(to: frozen + 5)
+        XCTAssertEqual(host.timeline.position, frozen, "a partner that stopped later changes nothing")
+        host.lowerHeldPosition(to: frozen - 3)
+        XCTAssertEqual(host.timeline.position, frozen - 3, accuracy: 1e-9)
+        let restart = host.setRemoteBuffering(false, now: 20, actualPosition: frozen)
+        XCTAssertEqual(restart?.position ?? -1, frozen - 3, accuracy: 1e-9, "the restart is from the earlier position")
+        // Not held: nothing to move.
+        var idle = SyncEngine(role: .host)
+        idle.lowerHeldPosition(to: 0)
+        XCTAssertFalse(idle.timeline.playing)
+    }
+}

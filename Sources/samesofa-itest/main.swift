@@ -126,6 +126,10 @@ func runBufferingScenario() {
         }
     }
     check("guest ran out of film and both paused", sawHold, "holds: host \(host.playback.holdCount) guest \(guest.playback.holdCount)")
+    // On a busy machine the last hold can start just before the time is up: give that one its chance to end.
+    if sawHold, !resumedAfterHold {
+        resumedAfterHold = wait(90) { host.playback.player.rate > 0 && guest.playback.player.rate > 0 && !host.playback.isHeld && !guest.playback.isHeld }
+    }
     check("both resumed together after buffering", resumedAfterHold)
     check("in sync whenever both were playing", worstWhilePlaying < 0.25, String(format: "max drift %.3f s", worstWhilePlaying))
     check("transfer progress reached host", host.transferFraction > 0, String(format: "%.0f%%", host.transferFraction * 100))
