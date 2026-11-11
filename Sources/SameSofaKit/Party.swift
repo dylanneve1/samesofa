@@ -671,6 +671,13 @@ public final class Party: ObservableObject {
         connectionDropped()
     }
 
+    /// Host: chunks of the current film handed to its channel so far (diagnostics, tests).
+    public var chunksSent: Int { sender?.chunksSent ?? 0 }
+    /// Host: the label of the channel the current film is sent on (diagnostics, tests).
+    public var filmChannel: String? { filmChannelLabel }
+    /// How many film channels this call has had so far (diagnostics, tests).
+    public var filmChannelCount: Int { fileChannels.count }
+
     /// Test hook: a control message arrives as if the partner had sent it (late ones included).
     public func injectForTesting(_ message: ControlMessage) { handle(message) }
 

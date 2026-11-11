@@ -72,6 +72,13 @@ if let list = args["convert-suite"], let server = args["server"].flatMap(URL.ini
     ConversionSuite(server: server, referenceFFmpeg: args["reference-ffmpeg"]).run(films: films)
 }
 
+// Rooms without a film, changing film, resuming (1.3).
+if let list = args["room-test"], let server = args["server"].flatMap(URL.init(string:)) {
+    let films = list.split(separator: ",").map { URL(fileURLWithPath: String($0)) }
+    guard films.count == 2 else { print("usage: --room-test a.mp4,b.mp4"); exit(2) }
+    RoomSuite(server: server).runRoom(filmA: films[0], filmB: films[1])
+}
+
 guard let server = args["server"].flatMap(URL.init(string:)), let filmPath = args["film"] else {
     print("usage: samesofa-itest --server ws://127.0.0.1:8787 --film test.mp4 [--soak seconds] [--throttle bytesPerSecond]")
     exit(2)

@@ -49,8 +49,10 @@ public enum FilmFingerprint {
         var hasher = SHA256()
         while true {
             if cancelled() { return nil }
-            guard let data = try? handle.read(upToCount: 4 << 20) else { return nil }
-            if data.isEmpty { break }
+            let data: Data?
+            do { data = try handle.read(upToCount: 4 << 20) } catch { return nil }
+            // nil or empty: the end of the file.
+            guard let data, !data.isEmpty else { break }
             hasher.update(data: data)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()

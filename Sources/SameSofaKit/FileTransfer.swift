@@ -195,12 +195,36 @@ public final class FileReceiver: NSObject, RTCDataChannelDelegate, AVAssetResour
     private var cancelled = false
     private var expectedHash: String?
     private var verifying = false
-    /// nil: not checked (yet). true: the complete file matches the host's hash.
-    public private(set) var verified: Bool?
-    /// How often a finished copy did not match and the resumed part was fetched again.
-    public private(set) var refetches = 0
-    /// Chunks that arrived over the network in this session.
-    public private(set) var chunksFetched = 0
+    private var verified: Bool?
+    private var refetches = 0
+    private var chunksFetched = 0
+
+    /// Where the transfer stands (for the readout and tests).
+    public struct Status: Equatable, Sendable {
+        /// Chunks the film has, chunks here now, chunks that were here from an earlier session,
+        /// chunks that arrived over the network in this session.
+        public var chunkCount = 0, received = 0, resumed = 0, fetched = 0
+        /// nil: not checked (yet). true: the complete file matches the host's hash.
+        public var verified: Bool?
+        /// How often a finished copy did not match and the resumed part was fetched again.
+        public var refetches = 0
+        public var isKept = false
+        public init() {}
+    }
+
+    public var status: Status {
+        queue.sync {
+            var status = Status()
+            status.chunkCount = scheduler.map.chunkCount
+            status.received = scheduler.map.receivedCount
+            status.resumed = resumedChunks
+            status.fetched = chunksFetched
+            status.verified = verified
+            status.refetches = refetches
+            status.isKept = cacheID != nil
+            return status
+        }
+    }
 
     public init(info: FileInfo, cache: FilmCache? = FilmCache.shared) throws {
         self.info = info
