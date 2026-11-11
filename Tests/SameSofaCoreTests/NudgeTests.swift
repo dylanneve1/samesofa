@@ -134,4 +134,27 @@ final class CompatibilityTests: XCTestCase {
         idle.lowerHeldPosition(to: 0)
         XCTAssertFalse(idle.timeline.playing)
     }
+
+    func testReceivedRanges() {
+        var map = ChunkMap(fileSize: 1000 * 100, chunkSize: 1000)
+        XCTAssertEqual(map.ranges(), [])
+        for index in Array(0..<10) + Array(50..<60) + [99] { _ = map.mark(index) }
+        XCTAssertEqual(map.ranges(), [[0, 9], [50, 59], [99, 99]])
+        let fractions = ChunkMap.fractions(ranges: map.ranges(), chunkCount: map.chunkCount)
+        XCTAssertEqual(fractions.count, 3)
+        XCTAssertEqual(fractions[1].lowerBound, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(fractions[1].upperBound, 0.6, accuracy: 1e-9)
+        XCTAssertEqual(fractions[2].upperBound, 1, accuracy: 1e-9)
+        // More runs than wanted: the narrowest gaps close first.
+        _ = map.mark(11)
+        XCTAssertEqual(map.ranges(limit: 3), [[0, 11], [50, 59], [99, 99]])
+        XCTAssertEqual(map.ranges(limit: 1), [[0, 99]])
+        // What another version sends is not trusted.
+        XCTAssertEqual(ChunkMap.fractions(ranges: [[5], [9, 3], [-1, 2], [0, 100], [1, 2]], chunkCount: 100).count, 1)
+        XCTAssertEqual(ChunkMap.chunkCount(fileSize: 100_001, chunkSize: 1000), 101)
+        // The message survives the wire, and a decoder that does not know it gives nil instead of failing loudly.
+        let message = ControlMessage.have(ranges: [[0, 9], [50, 59]])
+        XCTAssertEqual(ControlMessage.decode(message.encoded()), message)
+        XCTAssertNil(ControlMessage.decode(Data("{\"somethingNew\":{}}".utf8)))
+    }
 }

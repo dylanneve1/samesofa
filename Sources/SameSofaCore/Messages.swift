@@ -78,6 +78,9 @@ public enum ControlMessage: Codable, Equatable, Sendable {
     case want(chunks: [Int], urgent: Bool, reset: Bool? = nil)
     /// Guest -> host: how much of the film has arrived (0...1).
     case progress(fraction: Double)
+    /// Guest -> host: which parts of the film have arrived, as runs of
+    /// chunks `[first, last]` (for the host's seek bar). Older apps ignore it.
+    case have(ranges: [[Int]])
     /// Either side: a new timeline (play, pause or seek).
     case timeline(Timeline)
     /// Host -> guest every second: the current timeline plus where the host's

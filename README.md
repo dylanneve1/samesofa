@@ -50,6 +50,34 @@ hear each other.
 *(Screenshots use a generated test film and a generated stand-in camera
 picture.)*
 
+### New in 1.2.1
+
+- **A dropped connection comes back by itself.** Both sides show "Connection
+  lost. Trying to reconnect…", the film waits, and the call is set up again in
+  the same room; what the guest has received is kept and the film resumes
+  from where the first side stopped. "Try again" (also after a first
+  connection that failed) really tries again.
+- **Seeking ahead of the download** holds both sides at once, fetches from the
+  new place first, and the seek bar shows on both sides which parts the guest
+  already has. The transfer line shows bytes, speed and time left on both sides.
+- **Call audio:** a crash when the microphone and the loudspeaker callbacks
+  overlapped is fixed, microphones with any sample rate and channel count
+  work (several channels are mixed), a sound device that changes mid-film is
+  followed, and the ⓘ readout says why a microphone isn't working.
+- **Damaged video timing** (B-frames without reorder information) is repaired
+  by copying in more cases: films that do not start at zero, uneven frame
+  durations, MPEG-TS.
+- **Match display to film in full screen** (Settings ▸ Video): a TV or monitor
+  with a fixed refresh rate is switched to a rate that suits the film while
+  SameSofa is in full screen, and back afterwards.
+- **Test connection** (Settings ▸ Connection) checks the room server and the
+  TURN relay; a relay can be baked into a build.
+- **Different versions** can watch together; the newer copy says "Your partner
+  has an older SameSofa. Some things may not work until they update."
+- VoiceOver: every control in the first screens, Settings, About,
+  Acknowledgements and the readout has a name and a hint; the room code is one
+  field.
+
 ---
 
 ## Install (for the person who just wants to watch)
@@ -486,6 +514,30 @@ engine (silent) instead of the synthetic one. The
 `--throttle` run caps the host's upload below the film's bitrate and checks that
 both sides pause when the guest runs dry and resume together.
 
+More modes of the same test program (each prints PASS/FAIL lines and a summary):
+
+```sh
+I=.build/debug/samesofa-itest; S=ws://127.0.0.1:18787
+$I --server $S --film big.mp4 --throttle 5000000 --seek-test 1       # seeks into film that hasn't arrived
+$I --server $S --film big.mp4 --throttle 5000000 --reconnect-test 1  # the call drops mid-film; Try again on each side
+$I --server $S --film big.mp4 --throttle 1000000 --control-latency 1 # pause/play latency under a saturated upload
+$I --connection-test $S              # Settings ▸ Test connection, with a stand-in TURN relay in the test
+$I --timestamp-suite /tmp/ts         # damaged video timing: detection, repair, fallback
+$I --timestamp-edge-suite /tmp/ts    # time bases, start offsets, variable rate, MPEG-TS, injected wrong repairs
+$I --audio-thread-test 1             # the call's two audio threads against each other; microphone formats 8-192 kHz
+$I --audio-engine-test film.mp4      # the real audio engine at zero volume (add --real-output-switch 1 to change the default output for real)
+$I --display-mode-test 1             # the display's modes and the plan (add --switch 1 to switch and restore for real)
+$I --receiver-folder-test 1          # two copies on one Mac keep their own films
+$I --device-smoke 1                  # this Mac's real microphone and output, silently (see below)
+```
+
+`--device-smoke` is the one to run on a new Mac: it starts the call's audio
+as in a call, without a partner and without playing anything, prints the
+output and microphone by kind (built-in, USB, Bluetooth), the microphone's
+format and level, opens every other microphone in turn, and exits 0 or 1
+with a short table. `scripts/dev/ax-dump.swift <pid>` lists what VoiceOver
+finds in a running copy's windows.
+
 Conversion end-to-end test: generate the synthetic test films (each has a
 white flash and a beep at 1, 4, 7, … s), then run every one through the host's
 conversion, the transfer and synced playback:
@@ -589,9 +641,16 @@ scripts/                  build.sh, fetch-webrtc.sh, build-apm.sh, build-ffmpeg.
 - The film transfer and the video call share the host's upload. On a slow
   uplink the call video is capped at 700 kbit/s, but a large file transfer can
   still make the call choppier until the guest has enough buffered.
-- If the connection between the two drops (Wi-Fi change, sleep), the host goes
-  back to "waiting" with the same code and the guest has to rejoin; the guest
-  re-downloads the film into a new temporary file.
+- Reconnecting after a drop needs the room server: if that is unreachable
+  too, or the app is quit, the guest has to join again and the film is sent
+  again from the start (nothing is resumed across a relaunch).
+- Reconnecting, the output-device change and the microphone path were tested
+  on one Mac without a microphone (simulated drops, a stand-in second output
+  device, synthetic microphone formats). Run `samesofa-itest --device-smoke 1`
+  on a Mac with a real microphone.
+- A partner on 1.2.0 or earlier does not reconnect in place (it has to
+  rejoin) and shows no version note; 1.1.0 and 1.2.0 were tested against
+  1.2.1 in both roles on one Mac.
 - The guest needs free disk space roughly the size of the film.
 - One film per session; to switch films, leave and host again.
 - Converting (not just rewrapping) a film takes minutes and the guest can't

@@ -163,3 +163,43 @@ public struct ChunkScheduler: Sendable {
     /// Forget in-flight requests (e.g. after a reconnect) so they get re-asked.
     public mutating func resetInFlight() { inFlight.removeAll() }
 }
+
+extension ChunkMap {
+    /// The received parts as runs of chunks `[first, last]`, in order. With
+    /// more than `limit` runs (a film scrubbed through many times) the
+    /// narrowest gaps are closed until `limit` are left: it is a picture for
+    /// the seek bar, not a record.
+    public func ranges(limit: Int = 48) -> [[Int]] {
+        var runs: [[Int]] = []
+        var start: Int?
+        for index in 0..<chunkCount {
+            if has(index) {
+                if start == nil { start = index }
+            } else if let first = start {
+                runs.append([first, index - 1])
+                start = nil
+            }
+        }
+        if let first = start { runs.append([first, chunkCount - 1]) }
+        while runs.count > max(1, limit) {
+            var narrowest = 1
+            for i in 1..<runs.count where runs[i][0] - runs[i - 1][1] < runs[narrowest][0] - runs[narrowest - 1][1] { narrowest = i }
+            runs[narrowest - 1][1] = runs[narrowest][1]
+            runs.remove(at: narrowest)
+        }
+        return runs
+    }
+
+    /// Runs of chunks as shares of the film (0...1). Anything malformed is left out.
+    public static func fractions(ranges: [[Int]], chunkCount: Int) -> [ClosedRange<Double>] {
+        guard chunkCount > 0 else { return [] }
+        return ranges.compactMap { run in
+            guard run.count == 2, run[0] >= 0, run[1] >= run[0], run[1] < chunkCount else { return nil }
+            return (Double(run[0]) / Double(chunkCount))...(Double(run[1] + 1) / Double(chunkCount))
+        }
+    }
+
+    public static func chunkCount(fileSize: Int64, chunkSize: Int) -> Int {
+        chunkSize > 0 ? Int((fileSize + Int64(chunkSize) - 1) / Int64(chunkSize)) : 0
+    }
+}

@@ -187,6 +187,11 @@ func runSeekScenario() {
     host.playback.play()
     spin(2)
     _ = jump(0.5, from: host, label: "host to 50%", maxWait: 90)
+    // The seek bar's picture of what the guest has: the start and the part around the new position, on both sides.
+    check("received parts shown as separate ranges after a jump", wait(5) { guest.receivedRanges.count >= 2 },
+          guest.receivedRanges.map { String(format: "%.0f-%.0f%%", $0.lowerBound * 100, $0.upperBound * 100) }.joined(separator: " "))
+    check("the host sees the same ranges", wait(5) { host.receivedRanges.count == guest.receivedRanges.count && host.receivedRanges.count >= 2
+            && zip(host.receivedRanges, guest.receivedRanges).allSatisfy { abs($0.lowerBound - $1.lowerBound) < 0.03 && abs($0.upperBound - $1.upperBound) < 0.03 } })
     _ = jump(0.9, from: guest, label: "guest to 90%", maxWait: 90)
     // Scrub: ten quick seeks; only the last matters.
     let t0 = Date()

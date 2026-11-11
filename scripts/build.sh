@@ -16,7 +16,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
-VERSION=${SAMESOFA_VERSION:-1.2.0}
+VERSION=${SAMESOFA_VERSION:-1.2.1}
 BUILD_NUMBER=${SAMESOFA_BUILD_NUMBER:-1}
 SERVER_URL=${SAMESOFA_SERVER_URL:-}
 # Where the source code lives, for the About box (optional).

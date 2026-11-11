@@ -217,7 +217,8 @@ struct PartyView: View {
         let enabled = (party.phase == .together || party.role == .host) && party.preparing == nil && playback.isLoaded
         return VStack(spacing: 10) {
             ScrubBar(position: scrubbing ?? playback.position, duration: playback.duration,
-                     available: party.role == .guest ? party.transferFraction : 1) { value, ended in
+                     available: party.role == .guest ? party.transferFraction : 1,
+                     ranges: party.transferFraction < 1 ? party.receivedRanges : []) { value, ended in
                 scrubbing = ended ? nil : value
                 if ended { playback.seek(to: value) }
                 poke()
@@ -654,6 +655,10 @@ struct ScrubBar: View {
     let duration: Double
     /// Share of the film available locally (guest), drawn faintly.
     let available: Double
+    /// The parts of the film the guest has (0...1), drawn faintly on both
+    /// sides while the film is still arriving: after a jump ahead it shows
+    /// where playing will be immediate and where it has to wait.
+    var ranges: [ClosedRange<Double>] = []
     let onScrub: (Double, Bool) -> Void
     @State private var hovering = false
 
@@ -662,7 +667,15 @@ struct ScrubBar: View {
             let fraction = duration > 0 ? min(1, max(0, position / duration)) : 0
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.white.opacity(0.18)).frame(height: hovering ? 7 : 5)
-                Capsule().fill(Color.white.opacity(0.18)).frame(width: geo.size.width * available, height: hovering ? 7 : 5)
+                if ranges.isEmpty {
+                    Capsule().fill(Color.white.opacity(0.18)).frame(width: geo.size.width * available, height: hovering ? 7 : 5)
+                } else {
+                    ForEach(Array(ranges.enumerated()), id: \.offset) { _, range in
+                        RoundedRectangle(cornerRadius: 2).fill(Color.white.opacity(0.22))
+                            .frame(width: max(2, geo.size.width * (range.upperBound - range.lowerBound)), height: hovering ? 7 : 5)
+                            .offset(x: geo.size.width * range.lowerBound)
+                    }
+                }
                 Capsule().fill(Theme.accent).frame(width: max(0, geo.size.width * fraction), height: hovering ? 7 : 5)
                 Circle().fill(.white).frame(width: hovering ? 16 : 12, height: hovering ? 16 : 12)
                     .offset(x: geo.size.width * fraction - (hovering ? 8 : 6))

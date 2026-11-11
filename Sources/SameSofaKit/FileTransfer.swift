@@ -140,6 +140,8 @@ public final class FileReceiver: NSObject, RTCDataChannelDelegate, AVAssetResour
     var requestChunks: (([Int], Bool, Bool) -> Void)?
     /// Fraction received, called on the main queue (throttled).
     var onProgress: ((Double) -> Void)?
+    /// Which parts have arrived (runs of chunks, chunk count), with every progress report.
+    var onRanges: (([[Int]], Int) -> Void)?
     private var lastProgressReport = Date.distantPast
     public private(set) var bytesReceived: Int64 = 0
 
@@ -230,6 +232,10 @@ public final class FileReceiver: NSObject, RTCDataChannelDelegate, AVAssetResour
             lastProgressReport = Date()
             let fraction = scheduler.map.fraction
             if let onProgress { DispatchQueue.main.async { onProgress(fraction) } }
+            if let onRanges {
+                let ranges = scheduler.map.ranges(), count = scheduler.map.chunkCount
+                DispatchQueue.main.async { onRanges(ranges, count) }
+            }
         }
     }
 

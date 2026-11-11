@@ -68,6 +68,8 @@ public final class Party: ObservableObject {
     @Published public private(set) var transferLine = ""
     /// ICE failed or timed out while setting up: the view offers "Try again".
     @Published public private(set) var connectionFailed = false
+    /// Which parts of the film the guest has, as shares of the film (0...1), on both sides (for the seek bar).
+    @Published public private(set) var receivedRanges: [ClosedRange<Double>] = []
     /// The partner's SameSofa is older or newer than this one (shown as a note; nothing is blocked).
     @Published public private(set) var versionNote: String?
     private var connectTimeout: DispatchWorkItem?
@@ -437,6 +439,7 @@ public final class Party: ObservableObject {
 
     private func partnerLeft() {
         versionNote = nil
+        if role == .host { receivedRanges = [] }
         dropGrace?.cancel()
         partnerPositionTimeout?.cancel()
         awaitingPartnerPosition = false
@@ -494,6 +497,9 @@ public final class Party: ObservableObject {
             sender?.request(chunks, urgent: urgent, reset: reset ?? false)
         case .progress(let fraction):
             transferFraction = fraction
+        case .have(let ranges):
+            guard role == .host, let film = sharedFilm else { return }
+            receivedRanges = ChunkMap.fractions(ranges: ranges, chunkCount: ChunkMap.chunkCount(fileSize: film.size, chunkSize: film.chunkSize))
         case .timeline(let timeline):
             playback.receive(timeline)
         case .heartbeat(let timeline, let actual):
@@ -551,6 +557,10 @@ public final class Party: ObservableObject {
             receiver.onProgress = { [weak self] fraction in
                 self?.transferFraction = fraction
                 self?.control?.send(.progress(fraction: fraction))
+            }
+            receiver.onRanges = { [weak self] ranges, count in
+                self?.receivedRanges = ChunkMap.fractions(ranges: ranges, chunkCount: count)
+                self?.control?.send(.have(ranges: ranges))
             }
             if let fileChannel { receiver.attach(fileChannel) }
             let asset = AVURLAsset(url: receiver.playerURL)
