@@ -121,6 +121,36 @@ func runBufferingScenario() {
     finish()
 }
 
+/// Control messages while the film saturates the link: 10 pause, 10 play and
+/// 10 seek commands from each side; time until the other side's timeline moves.
+func runControlLatency() {
+    func measure(_ label: String, from: Party, to: Party) -> [Double] {
+        var out: [Double] = []
+        let dur = max(10, from.playback.duration)
+        for i in 0..<30 {
+            let before = to.playback.engine.timeline.seq
+            let t0 = Date()
+            switch i % 3 {
+            case 0: from.playback.pause()
+            case 1: from.playback.play()
+            default: from.playback.seek(to: dur * Double(i % 7 + 1) / 9)
+            }
+            if wait(5, { to.playback.engine.timeline.seq != before }) { out.append(Date().timeIntervalSince(t0) * 1000) } else { out.append(5000) }
+            spin(0.15)
+        }
+        out.sort()
+        let p50 = out[out.count / 2], p95 = out[Int(Double(out.count) * 0.95) - 1]
+        log(String(format: "control latency %@: p50 %.0f ms, p95 %.0f ms, max %.0f ms (transfer %.0f%%)", label, p50, p95, out.last!, to.transferFraction * 100))
+        check("control latency p95 < 250 ms (\(label))", p95 < 250, String(format: "p50 %.0f p95 %.0f", p50, p95))
+        return out
+    }
+    _ = measure("host->guest", from: host, to: guest)
+    _ = measure("guest->host", from: guest, to: host)
+    guest.leave()
+    host.leave()
+    finish()
+}
+
 func finish() -> Never {
     let passed = results.filter { $0.1 }.count
     log("SUMMARY \(passed)/\(results.count) checks passed")
@@ -201,6 +231,7 @@ let duration = host.playback.duration
 check("clock sync found the skew", wait(5) { abs(guest.playback.clockOffset + skew) < 0.005 },
       String(format: "offset %.4f s (true %.4f), best rtt %.1f ms", guest.playback.clockOffset, -skew, guest.clockRoundTrip * 1000))
 
+if args["control-latency"] != nil { runControlLatency() }
 if throttled { runBufferingScenario() }
 
 func positions() -> (Double, Double) { (host.playback.currentTime, guest.playback.currentTime) }
