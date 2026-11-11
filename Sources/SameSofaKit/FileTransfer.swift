@@ -57,11 +57,12 @@ final class FileSender: NSObject, RTCDataChannelDelegate {
         }
     }
 
-    func request(_ chunks: [Int], urgent: Bool) {
+    func request(_ chunks: [Int], urgent: Bool, reset: Bool = false) {
         Log.debug("sender: want \(chunks.count) urgent=\(urgent) first=\(chunks.first ?? -1)")
         queue.async {
             let fresh = chunks.filter { $0 >= 0 && $0 < self.info.chunkCount }
             if urgent {
+                if reset { self.pending.removeAll(); self.pendingSet.removeAll() }
                 self.pending.removeAll { fresh.contains($0) }
                 self.pending.insert(contentsOf: fresh, at: 0)
                 self.pendingSet.formUnion(fresh)
@@ -136,7 +137,7 @@ public final class FileReceiver: NSObject, RTCDataChannelDelegate, AVAssetResour
     private var channel: RTCDataChannel?
     private var loadingRequests: [AVAssetResourceLoadingRequest] = []
     /// Sends `want` messages on the control channel.
-    var requestChunks: (([Int], Bool) -> Void)?
+    var requestChunks: (([Int], Bool, Bool) -> Void)?
     /// Fraction received, called on the main queue (throttled).
     var onProgress: ((Double) -> Void)?
     private var lastProgressReport = Date.distantPast
@@ -197,10 +198,13 @@ public final class FileReceiver: NSObject, RTCDataChannelDelegate, AVAssetResour
 
     private func requestMore() {
         let urgent = scheduler.hasUrgent
+        // The player jumped: what was queued at the host for the old position is stale.
+        let jump = urgent && scheduler.urgentIsJump
+        if jump { scheduler.resetInFlight() }
         Log.debug("receiver: requestMore inflight=\(scheduler.inFlight.count) received=\(scheduler.map.receivedCount)")
         let next = scheduler.nextRequests()
         guard !next.isEmpty, let requestChunks else { return }
-        DispatchQueue.main.async { requestChunks(next, urgent) }
+        DispatchQueue.main.async { requestChunks(next, urgent, jump) }
     }
 
     // MARK: Incoming chunks

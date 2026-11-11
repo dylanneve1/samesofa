@@ -325,8 +325,8 @@ public final class Party: ObservableObject {
             guard role == .guest, receiver == nil else { return }
             preparing = nil
             receiveFilm(info)
-        case .want(let chunks, let urgent):
-            sender?.request(chunks, urgent: urgent)
+        case .want(let chunks, let urgent, let reset):
+            sender?.request(chunks, urgent: urgent, reset: reset ?? false)
         case .progress(let fraction):
             transferFraction = fraction
         case .timeline(let timeline):
@@ -374,7 +374,7 @@ public final class Party: ObservableObject {
             self.receiver = receiver
             sharedFilm = info
             filmName = (info.name as NSString).deletingPathExtension
-            receiver.requestChunks = { [weak self] chunks, urgent in self?.control?.send(.want(chunks: chunks, urgent: urgent)) }
+            receiver.requestChunks = { [weak self] chunks, urgent, jump in self?.control?.send(.want(chunks: chunks, urgent: urgent, reset: jump ? true : nil)) }
             receiver.onProgress = { [weak self] fraction in
                 self?.transferFraction = fraction
                 self?.control?.send(.progress(fraction: fraction))

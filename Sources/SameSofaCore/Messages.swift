@@ -73,7 +73,9 @@ public enum ControlMessage: Codable, Equatable, Sendable {
     case fileInfo(FileInfo)
     /// Guest -> host: please send these chunk indices (in this order).
     /// `urgent` requests jump the host's queue (the player is waiting on them).
-    case want(chunks: [Int], urgent: Bool)
+    /// `reset` (new apps only; older hosts ignore it): the guest has jumped, drop everything
+    /// queued for the old position; the guest re-asks for whatever it still needs.
+    case want(chunks: [Int], urgent: Bool, reset: Bool? = nil)
     /// Guest -> host: how much of the film has arrived (0...1).
     case progress(fraction: Double)
     /// Either side: a new timeline (play, pause or seek).

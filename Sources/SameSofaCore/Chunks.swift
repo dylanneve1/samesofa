@@ -101,7 +101,7 @@ public struct ChunkScheduler: Sendable {
     public var playheadChunk = 0
     public var tailChunks = 16
 
-    public init(map: ChunkMap, window: Int = 64) {
+    public init(map: ChunkMap, window: Int = 24) {
         self.map = map
         self.window = window
     }
@@ -126,6 +126,12 @@ public struct ChunkScheduler: Sendable {
 
     /// True while the player is waiting on chunks that have not been requested yet.
     public var hasUrgent: Bool { urgent.contains { !map.has($0) && !inFlight.contains($0) } }
+
+    /// True when the chunks the player is waiting on are far from anything already requested: a jump.
+    public var urgentIsJump: Bool {
+        guard let first = urgent.first(where: { !map.has($0) && !inFlight.contains($0) }) else { return false }
+        return !inFlight.contains { abs($0 - first) <= window }
+    }
 
     /// Next chunk indices to request, filling the window.
     public mutating func nextRequests() -> [Int] {
