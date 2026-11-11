@@ -8,6 +8,8 @@ final class ProtocolThreeTests: XCTestCase {
         let messages: [ControlMessage] = [
             .fileInfo(info), .filmChanging(film: 5, seq: 4000), .noFilm(film: 6, seq: 5000), .filmAck(film: 6),
             .filmHash(film: 4, sha256: "00ff"), .pong(t0: 1, t1: 2, hold: 0.004), .pong(t0: 1, t1: 2),
+            .upNext(name: "Episode 2"), .upNext(name: nil), .prefetch(info), .prefetchStop, .prefetchWant(chunks: [0, 5]),
+            .prefetchProgress(fraction: 0.5), .nextIn(seconds: 5, name: "Episode 2"), .nextCancel,
         ]
         for message in messages { XCTAssertEqual(ControlMessage.decode(message.encoded()), message) }
     }
@@ -47,6 +49,10 @@ final class ProtocolThreeTests: XCTestCase {
         XCTAssertNil(old(.noFilm(film: 1, seq: 1000)))
         XCTAssertNil(old(.filmAck(film: 1)))
         XCTAssertNil(old(.filmHash(film: 1, sha256: "00")))
+        XCTAssertNil(old(.upNext(name: "x")))
+        XCTAssertNil(old(.prefetch(info)))
+        XCTAssertNil(old(.nextIn(seconds: 5, name: "x")))
+        XCTAssertNil(old(.nextCancel))
     }
 
     func testVersionNotes() {

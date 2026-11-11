@@ -136,6 +136,21 @@ public enum ControlMessage: Codable, Equatable, Sendable {
     case filmAck(film: Int)
     /// Host -> guest: SHA-256 of the whole film, to check a finished copy against.
     case filmHash(film: Int, sha256: String)
+    // Up next (1.3): a short queue on the host; the next film travels ahead while the current one plays.
+    /// Host -> guest: the name of the film that comes after this one (nil: nothing is queued).
+    case upNext(name: String?)
+    /// Host -> guest: fetch this film in the background, it is next. Its bytes arrive on `channel`.
+    case prefetch(FileInfo)
+    /// Host -> guest: stop fetching it (the queue changed).
+    case prefetchStop
+    /// Guest -> host: chunks of the film being fetched in the background.
+    case prefetchWant(chunks: [Int])
+    /// Guest -> host: how much of it has arrived (0...1). Negative: this Mac cannot keep it.
+    case prefetchProgress(fraction: Double)
+    /// Host -> guest: the film is over; `name` starts in `seconds` unless one of the two says no.
+    case nextIn(seconds: Double, name: String)
+    /// Either side: not now.
+    case nextCancel
 
     /// 1: SameSofa 1.0 to 1.2.0. 2: 1.2.1 (reconnecting in the same room,
     /// seeks that drop queued chunks). 3: 1.3 (rooms without a film, changing

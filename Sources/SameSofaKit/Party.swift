@@ -36,6 +36,28 @@ public struct PartySettings {
     }
 }
 
+/// A film waiting in the host's "Up next" queue.
+public struct QueuedFilm: Identifiable, Equatable {
+    public enum State: Equatable {
+        case waiting
+        /// Being looked at / converted in the background (0...1).
+        case preparing(Double)
+        case ready
+        case failed(String)
+    }
+
+    public let id: UUID
+    public let url: URL
+    public var name: String
+    public var state: State
+}
+
+/// "Next: <name>" with a countdown, on both sides, when a film has ended and another one is queued.
+public struct NextCard: Equatable {
+    public var name: String
+    public var deadline: Date
+}
+
 /// One evening together: the room, the call, and whatever film is being
 /// watched at the moment, if any. The room and the call do not depend on the
 /// film: the host can open a room without one, change it, or close it, and
@@ -173,6 +195,54 @@ public final class Party: ObservableObject {
     /// Host: this partner has been told about a film on this visit.
     private var filmAnnounced = false
 
+    // Up next.
+    /// Host: the films that follow, in order.
+    @Published public private(set) var queue: [QueuedFilm] = []
+    /// Both: the name of the film that comes next (the guest's from the host), nil: none.
+    @Published public private(set) var upNextName: String?
+    /// Host: how much of the next film the partner already has (0...1); nil: it is not being sent ahead.
+    @Published public private(set) var nextFetched: Double?
+    /// Both: the film has ended and the next one is about to start.
+    @Published public private(set) var nextCard: NextCard?
+    public static let maxQueue = 8
+    /// Seconds between the end of a film and the start of the next.
+    public static let nextDelay = 5.0
+
+    private struct PreparedNext {
+        let id: UUID
+        let file: URL
+        let name: String
+        let videoConverted: Bool
+        let audioConverted: Bool
+        /// Its entry in the film cache, if it is kept there.
+        let cacheID: String?
+    }
+    /// Host: the first film of the queue, looked at and (if need be) converted, ready to be shared.
+    private var preparedNext: PreparedNext?
+    private var nextPreparer: FilmPreparer?
+    private var nextWork = 0
+    /// Host: sends the next film ahead while the current one plays.
+    private var nextSender: FileSender?
+    private var nextChannelLabel: String?
+    private var nextChannelCount = 0
+    /// Host: the partner cannot keep the next film (no room, keeping switched off): not offered again.
+    private var nextDeclined: UUID?
+    /// Host: the upload rate the last film reached, bytes per second (0: not measured).
+    public private(set) var lastFilmRate: Double = 0
+    /// Host: the limit the next film is sent ahead with, bytes per second (nil: none).
+    public private(set) var prefetchLimit: Double?
+    /// Host: "next" was cancelled for this film number; it is not offered again by itself.
+    private var nextDismissedFor: Int?
+    private var nextTimer: Timer?
+    private var endWatch: AnyCancellable?
+    private var playWhenLoaded = false
+    private var autoPlayWatch: AnyCancellable?
+    /// Guest: fetches the next film in the background.
+    private var prefetcher: FileReceiver?
+    private var prefetchChannel: String?
+    /// Guest: where the background fetch stands (tests).
+    public var prefetchStatus: FileReceiver.Status? { prefetcher?.status }
+
     public init(role: PeerRole, settings: PartySettings) {
         self.role = role
         self.settings = settings
@@ -188,6 +258,12 @@ public final class Party: ObservableObject {
         // Re-publish the playback controller's changes so SwiftUI views observing the party update.
         playback.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
         signaling.onEvent = { [weak self] event in self?.handle(event) }
+        if role == .host {
+            // The film ran to its end: if another one is queued, it follows by itself.
+            endWatch = playback.$reachedEnd.removeDuplicates().sink { [weak self] ended in
+                DispatchQueue.main.async { if ended { self?.filmEnded() } }
+            }
+        }
     }
 
     // MARK: Starting
@@ -276,6 +352,7 @@ public final class Party: ObservableObject {
         Log.debug("host: film \(turn.current) closed")
         endFilm()
         sendFilmState()
+        prepareNext()
     }
 
     /// Ends the current film on this side and starts the next number.
@@ -296,10 +373,14 @@ public final class Party: ObservableObject {
         filmName = nil
         filmNotice = reason
         sendFilmState()
+        prepareNext()
     }
 
     /// Host: everything of the current film goes; the room, the call and the code stay.
     private func endFilm() {
+        stopPrefetch()
+        playWhenLoaded = false
+        autoPlayWatch = nil
         if let preparer {
             preparer.cancel()
             self.preparer = nil
@@ -329,6 +410,9 @@ public final class Party: ObservableObject {
         transferFraction = 0
         transferLine = ""; rateMark = nil; smoothedRate = 0
         receivedRanges = []
+        nextTimer?.invalidate()
+        nextTimer = nil
+        nextCard = nil
     }
 
     /// Host: the film has been looked at; convert it if need be, then share it.
@@ -419,6 +503,17 @@ public final class Party: ObservableObject {
         Log.debug("host: film \(turn.current) shared (\(sender.info.chunkCount) chunks)")
         sendFilmState()
         refreshVersionNote()
+        if playWhenLoaded {
+            // The next film of the queue starts by itself, as soon as it can (together, when the partner is ready).
+            autoPlayWatch = playback.$isLoaded.filter { $0 }.first().sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self, self.playWhenLoaded, self.sender === sender else { return }
+                    self.playWhenLoaded = false
+                    self.playback.play()
+                }
+            }
+        }
+        prepareNext()
         let number = turn.current
         sender.computeFullHash { [weak self, weak sender] hash in
             guard let self, let sender, sender === self.sender, self.turn.current == number else { return }
@@ -519,8 +614,252 @@ public final class Party: ObservableObject {
         sender = nil
         if let preparedID { filmCache.release(preparedID) }
         preparedID = nil
+        dropNextWork()
+        stopPrefetching()
+        queue = []
+        upNextName = nil
         clearFilmState()
         phase = .ended("")
+    }
+
+    // MARK: Up next (host)
+
+    /// A queue is possible with nobody here yet or with a partner on 1.3.
+    public var canQueue: Bool { role == .host && !partnerIsOld }
+
+    /// Host: this film follows when the current one (and whatever is queued before it) is over.
+    public func addToQueue(_ film: URL) {
+        guard canQueue, queue.count < Self.maxQueue else { return }
+        queue.append(QueuedFilm(id: UUID(), url: film, name: film.deletingPathExtension().lastPathComponent, state: .waiting))
+        Log.debug("host: \(queue.count) film(s) queued")
+        queueChanged()
+    }
+
+    public func removeFromQueue(_ id: UUID) {
+        guard role == .host, let index = queue.firstIndex(where: { $0.id == id }) else { return }
+        queue.remove(at: index)
+        if index == 0 { dropNextWork() }
+        queueChanged()
+    }
+
+    private func setQueueState(_ id: UUID, _ state: QueuedFilm.State) {
+        guard let index = queue.firstIndex(where: { $0.id == id }), queue[index].state != state else { return }
+        queue[index].state = state
+    }
+
+    private func queueChanged() {
+        let name = queue.first?.name
+        if name != upNextName {
+            upNextName = name
+            control?.send(.upNext(name: name))
+        }
+        if queue.isEmpty, nextCard != nil { cancelNext() }
+        prepareNext()
+    }
+
+    /// Forgets what was prepared or being prepared for the head of the queue.
+    private func dropNextWork() {
+        nextWork += 1
+        if let nextPreparer {
+            nextPreparer.cancel()
+            self.nextPreparer = nil
+        }
+        if let prepared = preparedNext {
+            if let id = prepared.cacheID { filmCache.release(id) }
+            if prepared.file.path.hasPrefix(FilmPreparer.parentDirectory.path) { try? FileManager.default.removeItem(at: prepared.file) }
+        }
+        preparedNext = nil
+        stopPrefetch()
+    }
+
+    /// Host: gets the head of the queue ready in the background (looks at it, converts it if it has to
+    /// be), then sends it ahead. One conversion at a time: never while the current film is being converted.
+    private func prepareNext() {
+        guard role == .host, let first = queue.first else { return }
+        if preparedNext?.id == first.id { startPrefetch(); return }
+        guard nextPreparer == nil, first.state == .waiting, preparer == nil, !choosingFilm else { return }
+        setQueueState(first.id, .preparing(0))
+        nextWork += 1
+        let work = nextWork, id = first.id, url = first.url
+        Task { @MainActor in
+            do {
+                let check = try await FilmPreparer.inspect(url)
+                guard self.nextWork == work, self.queue.first?.id == id else { return }
+                switch check {
+                case .shareAsIs:
+                    self.nextReady(PreparedNext(id: id, file: url, name: url.lastPathComponent, videoConverted: false, audioConverted: false, cacheID: nil))
+                case .convert(let plan, let tools):
+                    let name = url.deletingPathExtension().appendingPathExtension("mp4").lastPathComponent
+                    let key = Self.conversionKey(film: url, plan: plan, tools: tools)
+                    if let key, let kept = self.filmCache.prepared(key: key) {
+                        self.nextReady(PreparedNext(id: id, file: kept.file, name: name, videoConverted: kept.videoConverted,
+                                                    audioConverted: kept.audioConverted, cacheID: kept.id))
+                        return
+                    }
+                    let preparer = FilmPreparer(input: url, plan: plan, tools: tools)
+                    self.nextPreparer = preparer
+                    preparer.onProgress = { [weak self, weak preparer] fraction, _ in
+                        guard let self, let preparer, preparer === self.nextPreparer else { return }
+                        self.setQueueState(id, .preparing(fraction))
+                    }
+                    self.conversionsRun += 1
+                    preparer.start { [weak self, weak preparer] result in
+                        guard let self, let preparer, preparer === self.nextPreparer else { return }
+                        self.nextPreparer = nil
+                        switch result {
+                        case .success(let output):
+                            let active = preparer.activePlan
+                            var file = output, cacheID: String?
+                            if let key, let kept = self.filmCache.adoptPrepared(key: key, file: output, videoConverted: active.reencodesVideo,
+                                                                                audioConverted: active.reencodesAudio) {
+                                file = kept.file
+                                cacheID = kept.id
+                            }
+                            self.nextReady(PreparedNext(id: id, file: file, name: name, videoConverted: active.reencodesVideo,
+                                                        audioConverted: active.reencodesAudio, cacheID: cacheID))
+                        case .failure(let error):
+                            if error is CancellationError { return }
+                            self.setQueueState(id, .failed(error.localizedDescription))
+                        }
+                    }
+                }
+            } catch {
+                guard self.nextWork == work, self.queue.first?.id == id else { return }
+                self.setQueueState(id, .failed(error.localizedDescription))
+            }
+        }
+    }
+
+    private func nextReady(_ prepared: PreparedNext) {
+        guard queue.first?.id == prepared.id else {
+            // No longer the head of the queue.
+            if let id = prepared.cacheID { filmCache.release(id) }
+            return
+        }
+        preparedNext = prepared
+        setQueueState(prepared.id, .ready)
+        startPrefetch()
+    }
+
+    /// Host: sends the next film ahead, on a channel of its own, once the current film has arrived
+    /// completely (it never competes with the film being watched) and at a limited rate (it leaves
+    /// room for the call): 60 % of what the last film's transfer reached. The guest keeps it in its
+    /// film cache, so when its turn comes nothing (or only the rest) has to be sent.
+    private func startPrefetch() {
+        guard role == .host, let prepared = preparedNext, nextSender == nil, nextDeclined != prepared.id, let call, let control,
+              turn.partnerFollowsChanges, turn.guestIsOnCurrentFilm, phase == .together, !reconnecting,
+              sender == nil ? !hasFilmActivity : transferFraction >= 1 else { return }
+        prefetchLimit = lastFilmRate > 0 ? max(128 * 1024, lastFilmRate * 0.6) : nil
+        guard let ahead = try? FileSender(url: prepared.file, name: prepared.name, videoConverted: prepared.videoConverted,
+                                          audioConverted: prepared.audioConverted, rateLimit: prefetchLimit) else { return }
+        nextChannelCount += 1
+        let label = FileInfo.laterChannelPrefix + "next-\(nextChannelCount)"
+        guard let channel = call.openFilmChannel(label: label) else { return }
+        fileChannels[label] = channel
+        nextChannelLabel = label
+        nextSender = ahead
+        ahead.attach(channel)
+        nextFetched = 0
+        var info = ahead.info
+        info.channel = label
+        Log.debug("host: sending the next film ahead (\(info.chunkCount) chunks, limit \(prefetchLimit.map { "\(Int($0 / 1024)) KiB/s" } ?? "none"))")
+        control.send(.prefetch(info))
+    }
+
+    private func stopPrefetch() {
+        guard nextSender != nil || nextChannelLabel != nil else { return }
+        nextSender?.stop()
+        nextSender = nil
+        if let label = nextChannelLabel, let channel = fileChannels.removeValue(forKey: label) {
+            ChannelRelay.attach(channel, to: nil)
+            channel.close()
+        }
+        nextChannelLabel = nil
+        nextFetched = nil
+        control?.send(.prefetchStop)
+    }
+
+    /// Host: the film ran to its end. With a film queued, both see "Next: …" and it starts after a few seconds.
+    private func filmEnded() {
+        guard role == .host, sharedFilm != nil, let first = queue.first, nextCard == nil, nextDismissedFor != turn.current, canChangeFilm else { return }
+        nextCard = NextCard(name: first.name, deadline: Date().addingTimeInterval(Self.nextDelay))
+        control?.send(.nextIn(seconds: Self.nextDelay, name: first.name))
+        nextTimer?.invalidate()
+        nextTimer = Timer.scheduledTimer(withTimeInterval: Self.nextDelay, repeats: false) { [weak self] _ in
+            guard let self, self.nextCard != nil else { return }
+            self.playNext()
+        }
+    }
+
+    /// Either side: "not now". The film stays where it ended; the queue stays as it is.
+    public func cancelNext() {
+        guard nextCard != nil else { return }
+        dismissNext()
+        control?.send(.nextCancel)
+    }
+
+    private func dismissNext() {
+        nextTimer?.invalidate()
+        nextTimer = nil
+        nextCard = nil
+        if role == .host { nextDismissedFor = turn.current }
+    }
+
+    /// Host: the next film of the queue, now. It starts playing by itself as soon as both are ready.
+    public func playNext() {
+        guard role == .host, canChangeFilm, let item = queue.first else { return }
+        queue.removeFirst()
+        let prepared = preparedNext?.id == item.id ? preparedNext : nil
+        preparedNext = nil
+        if prepared == nil { dropNextWork() }
+        Log.debug("host: next film from the queue (\(prepared == nil ? "not prepared yet" : "prepared"))")
+        if let prepared {
+            // Already looked at and converted: shared at once. What the guest fetched ahead is found in its cache.
+            beginFilmChange(name: item.name)
+            preparedID = prepared.cacheID
+            playWhenLoaded = true
+            do {
+                try startSharing(prepared.file, name: prepared.name, videoConverted: prepared.videoConverted, audioConverted: prepared.audioConverted)
+            } catch {
+                filmFailed(error.localizedDescription)
+            }
+        } else {
+            changeFilm(to: item.url)
+            playWhenLoaded = true
+        }
+        queueChanged()
+    }
+
+    // MARK: Up next (guest)
+
+    /// Guest: fetch the film that comes next, in the background, into the film cache.
+    private func startPrefetching(_ info: FileInfo) {
+        stopPrefetching()
+        guard info.size > 0, info.chunkSize >= 1024, info.chunkSize <= 1 << 22, info.fingerprint != nil,
+              let receiver = try? FileReceiver(info: info, cache: filmCache), receiver.isKept else {
+            // It cannot be kept here (no room, or keeping is switched off): it comes when its turn comes.
+            control?.send(.prefetchProgress(fraction: -1))
+            return
+        }
+        prefetcher = receiver
+        prefetchChannel = info.channel
+        receiver.requestChunks = { [weak self, weak receiver] chunks, _, _ in
+            guard let self, let receiver, receiver === self.prefetcher else { return }
+            self.control?.send(.prefetchWant(chunks: chunks))
+        }
+        receiver.onProgress = { [weak self, weak receiver] fraction in
+            guard let self, let receiver, receiver === self.prefetcher else { return }
+            self.control?.send(.prefetchProgress(fraction: fraction))
+        }
+        receiver.reportNow()
+        if let label = info.channel, let channel = fileChannels[label] { receiver.attach(channel) }
+    }
+
+    private func stopPrefetching() {
+        prefetcher?.cancel()
+        prefetcher = nil
+        if let label = prefetchChannel { fileChannels[label] = nil }
+        prefetchChannel = nil
     }
 
     // MARK: Room server
@@ -727,6 +1066,10 @@ public final class Party: ObservableObject {
         control?.close()
         control = nil
         sender?.detach()
+        nextSender?.stop()
+        nextSender = nil
+        nextChannelLabel = nil
+        nextFetched = nil
         fileChannels.removeAll()
         filmChannelLabel = nil
         firstChannelUsed = false
@@ -741,6 +1084,7 @@ public final class Party: ObservableObject {
         partnerVersion = nil
         filmAnnounced = false
         turn.connectionReset()
+        nextDeclined = nil
         if role == .host { receivedRanges = [] }
         dropGrace?.cancel()
         partnerPositionTimeout?.cancel()
@@ -771,6 +1115,7 @@ public final class Party: ObservableObject {
             turn.connectionReset()
             if sender != nil { playback.remoteBuffering(true, at: playback.currentTime) }
             sendFilmState()
+            if let upNextName { control.send(.upNext(name: upNextName)) }
         } else {
             if let guestFilm { control.send(.filmAck(film: guestFilm)) }
             control.send(.buffering(playback.engine.localBuffering, position: playback.currentTime))
@@ -842,6 +1187,34 @@ public final class Party: ObservableObject {
         case .filmAck(let film):
             guard role == .host else { return }
             turn.confirm(film)
+            prepareNext()
+        case .upNext(let name):
+            guard role == .guest else { return }
+            upNextName = name
+        case .prefetch(let info):
+            guard role == .guest else { return }
+            startPrefetching(info)
+        case .prefetchStop:
+            guard role == .guest else { return }
+            stopPrefetching()
+        case .prefetchWant(let chunks):
+            guard role == .host else { return }
+            nextSender?.request(chunks, urgent: false)
+        case .prefetchProgress(let fraction):
+            guard role == .host, nextSender != nil else { return }
+            if fraction < 0 {
+                // No room for it on the partner's Mac: it will simply be sent when its turn comes.
+                nextDeclined = preparedNext?.id
+                stopPrefetch()
+            } else {
+                nextFetched = fraction
+            }
+        case .nextIn(let seconds, let name):
+            guard role == .guest else { return }
+            nextCard = NextCard(name: name, deadline: Date().addingTimeInterval(max(0, seconds)))
+        case .nextCancel:
+            guard guestIsOnCurrentFilm else { return }
+            dismissNext()
         case .filmHash(let film, let hash):
             guard role == .guest, film == guestFilm else { return }
             receiver?.setExpectedHash(hash)
@@ -851,6 +1224,11 @@ public final class Party: ObservableObject {
         case .progress(let fraction):
             guard guestIsOnCurrentFilm else { return }
             transferFraction = fraction
+            if role == .host, fraction >= 1 {
+                // The film has arrived: the next one may travel ahead now.
+                if smoothedRate > 0 { lastFilmRate = smoothedRate }
+                prepareNext()
+            }
         case .have(let ranges):
             guard role == .host, guestIsOnCurrentFilm, let film = sharedFilm else { return }
             receivedRanges = ChunkMap.fractions(ranges: ranges, chunkCount: ChunkMap.chunkCount(fileSize: film.size, chunkSize: film.chunkSize))
@@ -914,6 +1292,8 @@ public final class Party: ObservableObject {
     /// Guest: the host moved on to film number `film` (or to none). What
     /// there was of the film before goes; the call stays as it is.
     private func guestFilmChanged(to film: Int, seq: Int) {
+        // What was being fetched ahead is handed back first: it may be the very film that starts now.
+        stopPrefetching()
         if let receiver {
             // Lets go of the film's channel too; whatever still arrives on it is for nobody.
             receiver.cancel()
@@ -931,6 +1311,12 @@ public final class Party: ObservableObject {
     }
 
     private func receiveFilm(_ info: FileInfo) {
+        // A description that makes no sense is not acted on.
+        guard info.size > 0, info.chunkSize >= 1024, info.chunkSize <= 1 << 22 else {
+            Log.debug("guest: film description not usable")
+            filmNotice = "That film couldn't be opened on this Mac. Ask your partner to choose it again."
+            return
+        }
         do {
             let receiver = try FileReceiver(info: info, cache: filmCache)
             self.receiver = receiver
@@ -1024,6 +1410,8 @@ extension Party: CallSessionDelegate {
             if sender != nil, filmChannelLabel == nil { assignFilmChannel() }
         } else if channel.label == wantedChannel {
             attachReceiver()
+        } else if channel.label == prefetchChannel {
+            prefetcher?.attach(channel)
         }
     }
 

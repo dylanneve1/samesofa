@@ -49,6 +49,14 @@ struct PartyView: View {
                     bubble(in: geo.size)
                 }
 
+                if filmOnScreen, let next = party.nextCard {
+                    // The film is over and another one is queued: it starts by itself unless one of the two says no.
+                    NextCardView(card: next, isHost: party.role == .host, cancel: { party.cancelNext() }, playNow: { party.playNext() })
+                        .padding(.trailing, 26).padding(.bottom, 118)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+
                 VStack(spacing: 0) {
                     topBar
                     Spacer()
@@ -60,6 +68,7 @@ struct PartyView: View {
                 CursorHider(hidden: !showChrome).frame(width: 0, height: 0)
             }
             .animation(.easeInOut(duration: 0.35), value: filmOnScreen)
+            .animation(.spring(duration: 0.35), value: party.nextCard)
             .onContinuousHover { phase in
                 // Only real pointer movement counts; SwiftUI also reports hover on re-render.
                 if case .active(let point) = phase {
@@ -106,6 +115,7 @@ struct PartyView: View {
 
     /// A film has been on in this room already (the next one is "another film").
     @State private var hadFilm = false
+    @State private var showQueue = LaunchOptions.shared.show == "queue"
 
     private var showChrome: Bool { !filmOnScreen || controlsVisible || !playback.intendsToPlay || showQuality }
 
@@ -228,6 +238,24 @@ struct PartyView: View {
                     .buttonStyle(PillButtonStyle())
                     .disabled(!party.canChangeFilm)
                     .help(party.canChangeFilm ? "Stop watching this film. The call goes on. (⇧⌘W)" : "Your partner needs SameSofa 1.3 for closing the film")
+                    Button { showQueue.toggle() } label: {
+                        Label(party.queue.isEmpty ? "Up next" : "Up next · \(party.queue.count)", systemImage: "list.bullet")
+                            .font(.system(size: 13, weight: .medium))
+                            .padding(.horizontal, 12).frame(height: 32)
+                    }
+                    .buttonStyle(PillButtonStyle())
+                    .disabled(!party.canQueue)
+                    .help(party.canQueue ? "What follows when this film ends" : "Your partner needs SameSofa 1.3 for a queue of films")
+                    .accessibilityLabel(party.queue.isEmpty ? "Up next" : "Up next, \(party.queue.count) queued")
+                    .popover(isPresented: $showQueue, arrowEdge: .bottom) {
+                        UpNextView(party: party, add: { model.addToQueue() })
+                    }
+                } else if let next = party.upNextName {
+                    Text("Next: \(next)")
+                        .font(.callout).foregroundStyle(.white.opacity(0.75)).lineLimit(1)
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(Capsule().fill(.black.opacity(0.45)))
+                        .accessibilityLabel("Up next: \(next)")
                 }
             }
             Spacer()
@@ -577,6 +605,104 @@ struct CircleButtonStyle: ButtonStyle {
             .background(Circle().fill(prominent ? Theme.accent : Color.white.opacity(configuration.isPressed ? 0.28 : (hovering ? 0.2 : 0.12))))
             .contentShape(Circle())
             .onHover { hovering = $0 }
+    }
+}
+
+/// "Next: <name>, starts in 5 s": shown to both when a film has ended and another one is queued.
+struct NextCardView: View {
+    let card: NextCard
+    let isHost: Bool
+    let cancel: () -> Void
+    let playNow: () -> Void
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.2)) { context in
+            let left = max(0, card.deadline.timeIntervalSince(context.date))
+            VStack(alignment: .leading, spacing: 10) {
+                Text("UP NEXT").font(.caption.weight(.semibold)).tracking(0.8).foregroundStyle(Theme.accent)
+                Text(card.name).font(.system(size: 20, weight: .semibold, design: .rounded)).lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                ProgressView(value: min(1, max(0, 1 - left / Party.nextDelay))).tint(Theme.accent).accessibilityHidden(true)
+                Text(left > 0.5 ? "Starts in \(Int(left.rounded(.up))) s" : "Starting…")
+                    .font(.callout.monospacedDigit()).foregroundStyle(.white.opacity(0.75))
+                HStack(spacing: 10) {
+                    Button(action: cancel) { Text("Cancel").frame(width: 100, height: 36) }
+                        .buttonStyle(SoftButtonStyle())
+                        .accessibilityHint("Stays on this film; the next one does not start by itself")
+                    if isHost {
+                        Button(action: playNow) { Text("Play now").fontWeight(.semibold).frame(width: 110, height: 36) }
+                            .buttonStyle(AccentButtonStyle())
+                    }
+                }
+            }
+            .padding(20)
+            .frame(width: 290, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 22, style: .continuous).fill(.black.opacity(0.5)))
+            .background(RoundedRectangle(cornerRadius: 22, style: .continuous).fill(.ultraThinMaterial))
+            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Theme.cardBorder))
+            .shadow(color: .black.opacity(0.5), radius: 24, y: 8)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Up next: \(card.name)")
+        }
+    }
+}
+
+/// The host's queue: what follows when this film ends.
+struct UpNextView: View {
+    @ObservedObject var party: Party
+    let add: () -> Void
+
+    private func line(_ film: QueuedFilm, first: Bool) -> String {
+        switch film.state {
+        case .waiting: return first ? "Waiting its turn to be got ready" : "Waiting"
+        case .preparing(let fraction): return fraction > 0.01 ? "Getting it ready… \(Int(fraction * 100))%" : "Getting it ready…"
+        case .ready:
+            guard first else { return "Ready" }
+            if let fetched = party.nextFetched {
+                return fetched >= 1 ? "Ready, and already on your partner's Mac" : "Ready · \(Int(fetched * 100))% already sent to your partner"
+            }
+            return "Ready"
+        case .failed(let reason): return "Can't be used: \(reason)"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Up next").font(.headline)
+            if party.queue.isEmpty {
+                Text("Nothing is queued. Add the next film or episode and it follows by itself when this one ends: it is got ready and sent to your partner in the background while you watch.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(Array(party.queue.enumerated()), id: \.element.id) { index, film in
+                    HStack(alignment: .top, spacing: 10) {
+                        Text("\(index + 1)").font(.callout.monospacedDigit()).foregroundStyle(.secondary).frame(width: 18, alignment: .trailing)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(film.name).lineLimit(1)
+                            Text(line(film, first: index == 0)).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        Button { party.removeFromQueue(film.id) } label: {
+                            Image(systemName: "xmark.circle.fill").font(.system(size: 16)).foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Remove from the queue")
+                        .accessibilityLabel("Remove \(film.name) from the queue")
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            HStack(spacing: 10) {
+                Button("Add a film…", action: add)
+                    .disabled(party.queue.count >= Party.maxQueue)
+                    .accessibilityHint("Chooses one or several films that follow this one")
+                Spacer()
+                Button("Play next now") { party.playNext() }
+                    .disabled(party.queue.isEmpty || !party.canChangeFilm)
+            }
+            .padding(.top, 4)
+        }
+        .padding(18)
+        .frame(width: 400, alignment: .leading)
     }
 }
 

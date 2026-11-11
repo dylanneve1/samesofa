@@ -28,6 +28,8 @@ public final class PlaybackController: ObservableObject {
     @Published public private(set) var quality = PlaybackQuality()
     /// Test hook, set before `load`.
     public var filmAudioMonitor: FilmAudioMonitor?
+    /// The film ran to its end (until someone plays, seeks or another film is loaded).
+    @Published public private(set) var reachedEnd = false
     /// How often the playback speed was nudged to stay in sync (diagnostics).
     public private(set) var nudgeCount = 0
     private var nudge = NudgeState()
@@ -215,6 +217,7 @@ public final class PlaybackController: ObservableObject {
 
     private func forgetFilm() {
         unload()
+        reachedEnd = false
         hasEnoughAhead = nil
         nudge.reset()
         hostSlipTicks = 0
@@ -250,6 +253,7 @@ public final class PlaybackController: ObservableObject {
     public func togglePlay() { intendsToPlay ? pause() : play() }
 
     public func play() {
+        reachedEnd = false
         let t = engine.play(now: sharedNow)
         send?(.timeline(t))
         apply()
@@ -262,6 +266,7 @@ public final class PlaybackController: ObservableObject {
     }
 
     public func seek(to seconds: Double) {
+        reachedEnd = false
         let clamped = max(0, duration > 0 ? min(seconds, duration - 0.5) : seconds)
         let t = engine.seek(to: clamped, now: sharedNow)
         send?(.timeline(t))
@@ -421,6 +426,15 @@ public final class PlaybackController: ObservableObject {
         let actual = currentTime
         if !seeking { position = actual }
         guard player.currentItem != nil else { return }
+
+        // The end of the film: the host stops the timeline there (for both), instead of
+        // both players standing at the end of a film that is still "playing".
+        if engine.role == .host, isLoaded, duration > 1, engine.effectivePlaying, !seeking, actual >= duration - 0.25 {
+            let t = engine.pause(now: now, at: duration)
+            send?(.timeline(t))
+            apply()
+            reachedEnd = true
+        }
 
         // Host heartbeat.
         if engine.role == .host, local - lastHeartbeat >= 1 {

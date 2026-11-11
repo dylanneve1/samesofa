@@ -29,8 +29,10 @@ final class FileSender: NSObject, RTCDataChannelDelegate {
 
     /// `name` is what the guest is told the film is called (defaults to the file name).
     /// `videoConverted`/`audioConverted`: whether the film had to be re-encoded, for the guest's readout.
-    init(url: URL, name: String? = nil, videoConverted: Bool? = nil, audioConverted: Bool? = nil) throws {
-        throttleBytesPerSecond = ProcessInfo.processInfo.environment["SAMESOFA_THROTTLE_BPS"].flatMap(Double.init)
+    /// `rateLimit`: bytes per second this sender may use at most (a film sent ahead leaves room for the call).
+    init(url: URL, name: String? = nil, videoConverted: Bool? = nil, audioConverted: Bool? = nil, rateLimit: Double? = nil) throws {
+        let testLimit = ProcessInfo.processInfo.environment["SAMESOFA_THROTTLE_BPS"].flatMap(Double.init)
+        throttleBytesPerSecond = [rateLimit, testLimit].compactMap { $0 }.min()
         self.url = url
         let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
@@ -270,12 +272,17 @@ public final class FileReceiver: NSObject, RTCDataChannelDelegate, AVAssetResour
         try? writer.close()
         try? reader.close()
         if let cache, let cacheID {
-            cache.saveMap(cacheID, map: scheduler.map, verified: verified == true)
-            cache.release(cacheID)
+            if !released {
+                cache.saveMap(cacheID, map: scheduler.map, verified: verified == true)
+                cache.release(cacheID)
+            }
         } else {
             try? FileManager.default.removeItem(at: cacheURL)
         }
     }
+
+    /// The kept copy has been handed back to the cache (by `cancel`): another receiver may take it over.
+    private var released = false
 
     /// Is this film kept for a later session?
     public var isKept: Bool { cacheID != nil }
@@ -294,7 +301,13 @@ public final class FileReceiver: NSObject, RTCDataChannelDelegate, AVAssetResour
             requestChunks = nil
             onProgress = nil
             onRanges = nil
-            saveMap(force: true)
+            // Written down and handed back at once (not when this object happens to go away): the same
+            // film may be announced again in the next moment, and must find its copy free.
+            if let cache, let cacheID, !released {
+                cache.saveMap(cacheID, map: scheduler.map, verified: verified == true)
+                cache.release(cacheID)
+                released = true
+            }
         }
     }
 
@@ -302,7 +315,7 @@ public final class FileReceiver: NSObject, RTCDataChannelDelegate, AVAssetResour
     var attachedChannel: RTCDataChannel? { queue.sync { channel } }
 
     private func saveMap(force: Bool = false) {
-        guard let cache, let cacheID, force || Date().timeIntervalSince(lastMapSave) > 2 else { return }
+        guard let cache, let cacheID, !released, force || Date().timeIntervalSince(lastMapSave) > 2 else { return }
         lastMapSave = Date()
         cache.saveMap(cacheID, map: scheduler.map, verified: verified == true)
     }

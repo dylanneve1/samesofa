@@ -321,7 +321,13 @@ final class ConversionSuite {
         log(String(format: "   (the test film was made with flash and beep at the same instant; after conversion audio - video = %+.1f ms)", idealMean * 1000))
         guest.leave()
         host.leave()
-        check("\(name): converted file removed after leaving", !FileManager.default.fileExists(atPath: shared.path))
+        // Since 1.3 the converted film is kept for a day (so that it is not converted twice, and so
+        // that the guest's copy still fits when it is shared again); nothing stays in the temporary folder.
+        let kept = FilmCache.shared.entryID(of: shared) != nil
+        let leftInTemp = ((try? FileManager.default.contentsOfDirectory(atPath: FilmPreparer.directory.path)) ?? []).filter { $0.hasSuffix(".mp4") }
+        check("\(name): converted film kept in the film cache, nothing left in the temporary folder",
+              kept ? FileManager.default.fileExists(atPath: shared.path) && leftInTemp.isEmpty : !FileManager.default.fileExists(atPath: shared.path),
+              kept ? "kept" : "not kept (keeping is off or the film is too big): removed")
     }
 
     func fileSize(_ url: URL) -> Int64 {

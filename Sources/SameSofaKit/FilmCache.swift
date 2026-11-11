@@ -61,7 +61,20 @@ public final class FilmCache {
     }
 
     private func directory(_ id: String) -> URL { root.appendingPathComponent(id, isDirectory: true) }
-    private func filmURL(_ id: String) -> URL { directory(id).appendingPathComponent(id.hasPrefix("prepared/") ? "film.mp4" : "film.bin") }
+    /// The film file of an entry: "film.mp4" for a converted film; for a received one "film." plus
+    /// the extension it was announced with (so that the file can also be opened for what it is).
+    private func filmURL(_ id: String) -> URL {
+        let dir = directory(id)
+        if !id.hasPrefix("prepared/"), let name = (try? fm.contentsOfDirectory(atPath: dir.path))?.first(where: { $0.hasPrefix("film.") }) {
+            return dir.appendingPathComponent(name)
+        }
+        return dir.appendingPathComponent("film.mp4")
+    }
+
+    private static func safeExtension(_ name: String) -> String {
+        let ext = (name as NSString).pathExtension.lowercased()
+        return !ext.isEmpty && ext.count <= 5 && ext.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) ? ext : "mp4"
+    }
     private func metaURL(_ id: String) -> URL { directory(id).appendingPathComponent("meta.json") }
     private func lockURL(_ id: String) -> URL { directory(id).appendingPathComponent("in-use") }
 
@@ -129,7 +142,7 @@ public final class FilmCache {
         let id = "received/\(print)"
         lock.lock(); defer { lock.unlock() }
         guard !held.contains(id), !heldElsewhere(id) else { return nil }
-        let file = filmURL(id)
+        var file = filmURL(id)
         var map: ChunkMap?
         var verified = false
         if let meta = readMeta(id), meta.size == info.size, meta.chunkSize == info.chunkSize, let bitmap = meta.bitmap,
@@ -140,6 +153,7 @@ public final class FilmCache {
         } else {
             // Nothing usable: start clean.
             try? fm.removeItem(at: directory(id))
+            file = directory(id).appendingPathComponent("film." + Self.safeExtension(info.name))
         }
         let have = map.map { allocatedBytes(file) > 0 ? $0.receivedBytes : 0 } ?? 0
         sweepLocked(incoming: max(0, info.size - have), keeping: id)

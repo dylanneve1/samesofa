@@ -299,6 +299,32 @@ final class RoomSuite {
         check("the room code never changed", host.code == code && guest.code == code)
         check("no version note between two copies of the same version", host.versionNote == nil && guest.versionNote == nil)
 
+        // 9. Now a real drop, with film B (a film that has a channel of its own): the call comes back in the
+        //    same room and the film goes on, on the new connection's first channel.
+        throttle(400_000)
+        // (The guest still has film B from before; forget that copy so that there is something to fetch.)
+        guestCache.clear()
+        host.changeFilm(to: filmB)
+        check("before the drop: film B is arriving on a channel of its own", loaded(host, guest) && host.filmChannel != FileInfo.firstChannel
+                && guest.receiver?.isComplete == false, "channel \(host.filmChannel ?? "-")")
+        host.playback.play()
+        wait(20) { self.bothPlaying(host, guest) }
+        let fractionBefore = guest.receiver?.fraction ?? 0
+        guest.dropConnectionForTesting()
+        check("after a drop: connected again in the same room", wait(45) { host.phase == .together && guest.phase == .together && !host.reconnecting
+                && !guest.reconnecting && host.reconnects >= 1 } && host.code == code, "host set the call up \(host.reconnects) more time(s)")
+        check("after a drop: the film is the same one, now on the new connection's first channel", guest.sharedFilm?.film == host.turn.current
+                && host.filmChannel == FileInfo.firstChannel && (guest.receiver?.fraction ?? 0) >= fractionBefore)
+        check("after a drop: the film plays on both sides again", wait(30) { self.bothPlaying(host, guest) })
+        spin(3)
+        check("after a drop: in sync", drift(host, guest) < 0.25, String(format: "%.3f s apart", drift(host, guest)))
+        check("after a drop: the rest of the film arrives", wait(120) { guest.receiver?.isComplete == true })
+        if let receiver = guest.receiver { check("after a drop: byte-identical", sha256(receiver.cacheURL) == sha256(filmB)) }
+        // And the film can still be changed afterwards.
+        throttle(nil)
+        host.changeFilm(to: filmA)
+        check("after a drop: changing film still works", loaded(host, guest) && host.filmChannel == FileInfo.laterChannelPrefix + String(host.turn.current))
+
         guest.leave()
         check("the guest leaving leaves the host in the room with its film", wait(10) { if case .waitingForPartner = host.phase { return true }; return false }
               && host.sharedFilm != nil)
@@ -383,8 +409,11 @@ final class RoomSuite {
         }
 
         // 3. A kept copy that got damaged on disk: found out by the hash, fetched again.
-        if let file = try? FileManager.default.contentsOfDirectory(at: work.appendingPathComponent("g1/received"), includingPropertiesForKeys: nil).first?
-            .appendingPathComponent("film.bin"), let handle = try? FileHandle(forWritingTo: file) {
+        let keptFolder = try? FileManager.default.contentsOfDirectory(at: work.appendingPathComponent("g1/received"), includingPropertiesForKeys: nil).first
+        let keptFile = keptFolder.flatMap { folder in
+            (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil))?.first { $0.lastPathComponent.hasPrefix("film.") }
+        }
+        if let file = keptFile, let handle = try? FileHandle(forWritingTo: file) {
             try? handle.seek(toOffset: 5_000_000)
             try? handle.write(contentsOf: Data(repeating: 0xAA, count: 3000))
             try? handle.close()
@@ -488,6 +517,95 @@ final class RoomSuite {
         check("a kept film not used for 24 hours is removed", !before.isEmpty && aged.entries.isEmpty, "\(before.count) before, \(aged.entries.count) after")
         let switchedOff = cache("g-off", capacity: 0)
         check("with keeping switched off nothing is kept", switchedOff.openReceived(info: FileInfo(size: 1000, name: "x.mp4", uti: "public.mpeg-4", fingerprint: "abc")) == nil)
+        finish()
+    }
+
+    // MARK: Up next
+
+    func size(_ url: URL) -> Int64 { Int64((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)??.int64Value ?? 0) }
+
+    /// A short film with another one queued behind it: the next film is got ready and sent ahead while the
+    /// first plays (after it has arrived, at a limited rate), both see the card at the end, and it starts by itself.
+    func runNext(short: URL, filmB: URL) -> Never {
+        throttle(1_000_000)
+        let guestCache = cache("guest")
+        guard let (host, guest) = pair(hostCache: cache("host"), guestCache: guestCache, label: "up next") else { finish() }
+        host.changeFilm(to: short)
+        check("the short film loads", loaded(host, guest))
+        host.addToQueue(filmB)
+        check("the guest is told what comes next", wait(5) { guest.upNextName == filmB.deletingPathExtension().lastPathComponent } && host.queue.count == 1,
+              guest.upNextName ?? "-")
+        check("nothing is sent ahead while the film itself is still arriving", host.nextFetched == nil || guest.transferFraction >= 1)
+        host.playback.play()
+        check("the short film plays", wait(30) { self.bothPlaying(host, guest) })
+        var worst = 0.0, started: Date?
+        let ahead = wait(60) {
+            if started == nil, host.nextFetched != nil { started = Date() }
+            if self.bothPlaying(host, guest) { worst = max(worst, self.drift(host, guest)) }
+            return host.nextFetched == 1
+        }
+        let took = Date().timeIntervalSince(started ?? Date())
+        let limit = host.prefetchLimit ?? 0
+        check("the next film is got ready and sent ahead while this one plays", ahead && host.queue.first?.state == .ready,
+              String(format: "%.1f s for %.1f MB", took, Double(size(filmB)) / 1e6))
+        check("it is sent at a limited rate: 60 percent of what the film's own transfer reached", host.lastFilmRate > 0 && abs(limit - host.lastFilmRate * 0.6) < 1
+                && took >= 0.7 * Double(size(filmB)) / max(1, limit),
+              String(format: "film %.0f KB/s, limit %.0f KB/s, sent ahead at %.0f KB/s", host.lastFilmRate / 1000, limit / 1000, Double(size(filmB)) / max(0.1, took) / 1000))
+        check("the film being watched stayed in sync meanwhile", worst < 0.25, String(format: "worst %.3f s", worst))
+        check("the guest keeps the next film next to the current one", guestCache.entries.count == 2 && guest.prefetchStatus?.received == guest.prefetchStatus?.chunkCount
+                && guest.prefetchStatus != nil)
+
+        // The end of the film.
+        check("at the end both see the next-film card", wait(60) { host.nextCard != nil && guest.nextCard != nil }
+                && host.nextCard?.name == guest.nextCard?.name && host.playback.reachedEnd && host.playback.player.rate == 0 && guest.playback.player.rate == 0,
+              host.nextCard?.name ?? "-")
+        let cardAt = Date()
+        let advanced = wait(15) { guest.sharedFilm?.name == filmB.lastPathComponent && guest.playback.isLoaded && host.playback.isLoaded }
+        let after = Date().timeIntervalSince(cardAt)
+        check("the next film starts by itself after 5 seconds", advanced && after > 4 && after < 8, String(format: "%.1f s after the card", after))
+        let status = guest.receiver?.status ?? .init()
+        check("nothing has to be fetched: it was all sent ahead", status.fetched == 0 && status.resumed == status.chunkCount && host.chunksSent == 0,
+              "\(status.fetched) chunks fetched")
+        check("it plays by itself on both sides", wait(20) { self.bothPlaying(host, guest) })
+        spin(2)
+        check("in sync", drift(host, guest) < 0.25, String(format: "%.3f s apart", drift(host, guest)))
+        check("the queue is empty again, on both sides", host.queue.isEmpty && wait(3) { guest.upNextName == nil } && host.nextCard == nil && guest.nextCard == nil)
+        check("the complete copy is checked against the host's hash", wait(20) { guest.receiver?.status.verified == true })
+
+        // Either of the two can say no.
+        host.addToQueue(short)
+        check("queued again", wait(5) { guest.upNextName != nil })
+        host.playback.seek(to: host.playback.duration - 4)
+        check("second film ends: the card appears", wait(30) { host.nextCard != nil && guest.nextCard != nil })
+        guest.cancelNext()
+        check("the guest cancels: the card goes on both sides", wait(3) { host.nextCard == nil && guest.nextCard == nil })
+        spin(Party.nextDelay + 2)
+        check("and the next film does not start by itself", guest.sharedFilm?.name == filmB.lastPathComponent && host.queue.count == 1
+                && host.playback.player.rate == 0 && guest.playback.player.rate == 0)
+        host.playNext()
+        check("the host starts it by hand", wait(20) { guest.sharedFilm?.name == short.lastPathComponent && guest.playback.isLoaded }
+              && wait(20) { self.bothPlaying(host, guest) })
+        for (name, party) in [("host", host), ("guest", guest)] {
+            let (ok, detail) = connectionStayedUp(party)
+            check("\(name): the peer connection never left 'connected'", ok, detail)
+        }
+        quit(host, guest)
+
+        // No room on the guest's Mac for the next film: nothing is sent ahead; it comes when its turn comes.
+        throttle(nil)
+        let tight = cache("guest-tight", capacity: size(short) + 100_000)
+        if let (host, guest) = pair(hostCache: cache("host"), guestCache: tight, label: "no room") {
+            host.changeFilm(to: short)
+            check("no room: the short film loads", loaded(host, guest) && wait(20) { guest.receiver?.isComplete == true })
+            host.addToQueue(filmB)
+            check("no room: the next film is ready on the host", wait(20) { host.queue.first?.state == .ready })
+            spin(2)
+            check("no room: it is not sent ahead", host.nextFetched == nil && guest.prefetchStatus == nil)
+            host.playNext()
+            check("no room: it still plays when its turn comes", wait(60) { guest.sharedFilm?.name == filmB.lastPathComponent && guest.playback.isLoaded }
+                  && wait(20) { self.bothPlaying(host, guest) } && (guest.receiver?.status.fetched ?? 0) > 0)
+            quit(host, guest)
+        }
         finish()
     }
 }

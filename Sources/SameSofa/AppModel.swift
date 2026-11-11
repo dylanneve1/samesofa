@@ -108,7 +108,7 @@ struct LaunchOptions {
     /// Things to do by themselves once the two are together (or, with `--script-alone`, once the room is
     /// open), for tests and screenshots: "8:film=/path/a.mp4;20:close;25:film=/path/b.mkv;40:drop;50:leave".
     /// Seconds count from that moment. Actions: film=<path>, close, play, pause, seek=<seconds>, drop,
-    /// camera=on|off, mic=on|off, leave.
+    /// camera=on|off, mic=on|off, queue=<path>, next, cancelnext, leave.
     var script: [(after: Double, action: String, argument: String)] = []
     var scriptAlone = false
 
@@ -270,6 +270,30 @@ final class AppModel: ObservableObject {
         party?.closeFilm()
     }
 
+    /// Films can be queued behind the one being watched (the host, with a partner on 1.3 or nobody yet).
+    var canQueue: Bool {
+        guard screen == .party, let party else { return false }
+        return party.canQueue && party.hasFilmActivity && party.queue.count < Party.maxQueue
+    }
+
+    /// "Add to Up Next…": one or several films that follow by themselves.
+    func addToQueue() {
+        guard canQueue else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose what to watch next"
+        panel.prompt = "Add"
+        let extra = Self.filmExtensions.compactMap { UTType(filenameExtension: $0, conformingTo: .movie) }
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie, .audiovisualContent] + extra
+        panel.allowsMultipleSelection = true
+        let done: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let party = self?.party else { return }
+            for url in panel.urls.sorted(by: { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }) {
+                party.addToQueue(url)
+            }
+        }
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow { panel.beginSheetModal(for: window, completionHandler: done) } else { panel.begin(completionHandler: done) }
+    }
+
     /// "Start a room": no film; the two see and hear each other, and a film can be chosen later.
     func startRoom() {
         guard let ps = partySettings() else { return }
@@ -365,6 +389,9 @@ final class AppModel: ObservableObject {
                 case "pause": party.playback.pause()
                 case "seek": party.playback.seek(to: Double(step.argument) ?? 0)
                 case "drop": party.dropConnectionForTesting()
+                case "queue": party.addToQueue(URL(fileURLWithPath: step.argument))
+                case "next": party.playNext()
+                case "cancelnext": party.cancelNext()
                 case "camera": party.cameraOn = step.argument != "off"
                 case "mic": party.micOn = step.argument != "off"
                 case "leave": self.leaveParty()

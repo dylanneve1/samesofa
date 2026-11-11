@@ -84,6 +84,12 @@ if let list = args["resume-test"], let server = args["server"].flatMap(URL.init(
     RoomSuite(server: server).runResume(filmA: films[0], filmB: films[1], rewrapped: films[2], converted: films[3])
 }
 
+if let list = args["next-test"], let server = args["server"].flatMap(URL.init(string:)) {
+    let films = list.split(separator: ",").map { URL(fileURLWithPath: String($0)) }
+    guard films.count == 2 else { print("usage: --next-test short.mp4,b.mp4"); exit(2) }
+    RoomSuite(server: server).runNext(short: films[0], filmB: films[1])
+}
+
 guard let server = args["server"].flatMap(URL.init(string:)), let filmPath = args["film"] else {
     print("usage: samesofa-itest --server ws://127.0.0.1:8787 --film test.mp4 [--soak seconds] [--throttle bytesPerSecond]")
     exit(2)

@@ -78,6 +78,12 @@ picture.)*
   is already there. A finished copy is checked against a hash of the whole
   film. Films the host had to convert are kept the same way, so they are not
   converted twice.
+- **Up next.** The host can queue films (the *Up next* button on the film, or
+  File ▸ Add to Up Next…). The next one is got ready in the background and,
+  once the current film has arrived completely, sent ahead to the partner at
+  a limited rate, so it starts without waiting. When a film ends, both see
+  "Up next: …" for five seconds; either can cancel, otherwise it starts by
+  itself.
 - **A press of a button no longer vanishes** when the other side's player
   changes the timeline at the same instant (for instance the automatic
   restart after buffering).
@@ -258,6 +264,15 @@ takes away again:
 - The host's Mac checks a newly picked file (and converts it if it has to)
   while the two of you keep talking; the guest sees "Your partner is choosing
   another film…", then the usual preparing and receiving messages.
+- **Up next** builds on the same parts. The head of the host's queue is
+  looked at and converted in the background (never while the current film is
+  being converted). When the guest has all of the current film, the next one
+  is sent on a further channel at 60 % of the rate the current film's
+  transfer reached, straight into the guest's film cache. When its turn
+  comes it is an ordinary change of film whose bytes happen to be there
+  already. When the host's player reaches the end, the host pauses the
+  shared timeline there, both show the card, and after five seconds the host
+  changes film and presses play; a cancel from either side stops that.
 
 ### Getting the film to the guest: the original bytes, over a data channel
 
@@ -630,6 +645,7 @@ $I --server $S --film big.mp4 --throttle 5000000 --reconnect-test 1  # the call 
 $I --server $S --film big.mp4 --throttle 1000000 --control-latency 1 # pause/play latency under a saturated upload
 $I --server $S --room-test a.mp4,b.mp4           # 1.3: a room without a film, film A, change to B mid-transfer, close, A again (resumed)
 $I --server $S --resume-test a.mp4,b.mp4,rewrapped.mkv,converted.mkv   # resuming across relaunches, converted films, a damaged copy, the size limit
+$I --server $S --next-test short.mp4,b.mp4       # up next: sent ahead while the short film plays, the card at its end, auto-advance, cancel
 $I --server $S --film big.mp4 --throttle 1000000 --control-stress 500  # 500 commands from both sides under a saturated upload; none may be lost
 SAMESOFA_TEST_CONTROL_DELAY_MS=40 $I --server $S --film test.mp4 --tie-stress 100   # both press at the same moment (40 ms apart in network terms)
 $I --server $S --film big.mp4 --clock-only 1     # clock offset while the film saturates the link (run it in a loop)
@@ -772,7 +788,11 @@ scripts/                  build.sh, fetch-webrtc.sh, build-apm.sh, build-ffmpeg.
 - A partner on 1.2.0 or earlier does not reconnect in place (it has to
   rejoin) and shows no version note.
 - The guest needs free disk space roughly the size of the film.
-- No queue of films ("up next") yet: the host picks the next film by hand.
+- Up next sends only one film ahead, only after the current one has arrived
+  completely, and only if the partner's Mac may keep it (Settings ▸ Films);
+  otherwise it is sent when its turn comes. Its rate limit (60 % of the rate
+  the current film's transfer reached) is a guess at what leaves the call
+  alone, not a measurement of the line.
 - Converting (not just rewrapping) a film takes minutes and the guest can't
   start before it's done. Re-encoded video loses a little quality.
 - Only one audio track and one subtitle track are carried; picture-based

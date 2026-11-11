@@ -23,6 +23,9 @@ struct SameSofaApp: App {
                 Button("Open…") { model.chooseFilm() }
                     .keyboardShortcut("o", modifiers: .command)
                     .disabled(!model.canChooseFilm)
+                Button("Add to Up Next…") { model.addToQueue() }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                    .disabled(!model.canQueue)
                 Button("Close Film") { model.closeFilm() }
                     .keyboardShortcut("w", modifiers: [.command, .shift])
                     .disabled(!model.canCloseFilm)

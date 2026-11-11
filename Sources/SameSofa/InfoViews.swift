@@ -251,11 +251,12 @@ struct ShortcutsView: View {
         ("M", "Mute or unmute your microphone"),
         ("Esc", "Leave full screen"),
         ("⌘O", "Choose a film (the host; the call goes on)"),
+        ("⇧⌘O", "Add a film to Up next (the host)"),
         ("⇧⌘W", "Close the film, stay in the room (the host)"),
     ]
     /// How VoiceOver should say the keys.
     static let spoken = ["Space": "Space bar", "←  →": "Left arrow and right arrow", "F": "F", "M": "M", "Esc": "Escape",
-                         "⌘O": "Command O", "⇧⌘W": "Shift Command W"]
+                         "⌘O": "Command O", "⇧⌘O": "Shift Command O", "⇧⌘W": "Shift Command W"]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
