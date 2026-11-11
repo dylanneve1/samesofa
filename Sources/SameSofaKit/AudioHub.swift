@@ -256,6 +256,7 @@ public final class AudioHub: NSObject, RTCAudioDevice {
     /// than `referenceLead`: reading at the clock's own position is still
     /// ahead of what the microphone can hear. Starts again with every film.
     private var filmLeadTrim = 0.0
+    private var lateStreak = 0
     private var seenFilmEpoch = 0
     private var syntheticPhase = 0.0
 
@@ -806,6 +807,7 @@ public final class AudioHub: NSObject, RTCAudioDevice {
         if epoch != seenFilmEpoch {
             seenFilmEpoch = epoch
             filmLeadTrim = 0
+            lateStreak = 0
             trimMilliseconds.value = 0
             filmCursor.reset()
         }
@@ -819,12 +821,17 @@ public final class AudioHub: NSObject, RTCAudioDevice {
         let desired = (media + (target - filmLeadTrim - now) * speed) * rate
         let read = filmCursor.next(desired: desired, step: speed * rate / Self.rtcRate, frames: frames)
         let arrived = filmReference.mix(start: read.start, step: read.step, frames: frames, gain: filmGain.value, left: left, right: right)
-        if !arrived {
+        if arrived {
+            lateStreak = 0
+        } else {
             lateCount.add(1)
-            if filmLeadTrim < Self.referenceLead {
-                // Asked for film sound the player has not handed over yet: read a
-                // little later from now on (the canceller re-finds the delay),
-                // but never later than the clock itself.
+            lateStreak += 1
+            // Asked for film sound the player has not handed over yet. Once is
+            // normal right after a seek. If it keeps happening, read a little
+            // later from now on (the canceller re-finds the delay), but never
+            // later than the clock itself.
+            if lateStreak >= 3, filmLeadTrim < Self.referenceLead {
+                lateStreak = 0
                 filmLeadTrim = min(Self.referenceLead, filmLeadTrim + 0.01)
                 trimMilliseconds.value = Int((filmLeadTrim * 1000).rounded())
             }

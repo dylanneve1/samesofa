@@ -36,6 +36,8 @@ enum AudioThreadTests {
     /// Stands in for WebRTC: plays a constant, and looks at what the microphone path delivers.
     final class FakeCall: NSObject, RTCAudioDeviceDelegate {
         static let voiceSample: Int16 = 8192
+        /// Play digital silence instead (for tests with a real output).
+        var silent = false
         let state = OSAllocatedUnfairLock(initialState: State())
 
         struct State {
@@ -58,9 +60,10 @@ enum AudioThreadTests {
             return noErr
         }
 
-        lazy var getPlayoutData: RTCAudioDeviceGetPlayoutDataBlock = { _, _, _, frames, data in
+        lazy var getPlayoutData: RTCAudioDeviceGetPlayoutDataBlock = { [unowned self] _, _, _, frames, data in
             guard let samples = data.pointee.mBuffers.mData?.assumingMemoryBound(to: Int16.self) else { return noErr }
-            for i in 0..<Int(frames) { samples[i] = FakeCall.voiceSample }
+            let value = self.silent ? 0 : FakeCall.voiceSample
+            for i in 0..<Int(frames) { samples[i] = value }
             return noErr
         }
 
@@ -247,6 +250,162 @@ enum AudioThreadTests {
         let steepest = expectedPeak * 2 * Double.pi * 1000 / 48_000
         if Double(largestStep) > steepest * 1.15 + 3 { return "a jump of \(largestStep) between two samples (tone: at most \(Int(steepest)))" }
         return nil
+    }
+
+    // MARK: The real engine
+
+    static func spin(_ seconds: Double) { RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
+
+    @discardableResult
+    static func waitUntil(_ timeout: Double, _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            spin(0.05)
+        }
+        return condition()
+    }
+
+    static func deviceUID(_ device: AudioDeviceID) -> String? {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var uid: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &uid) == noErr, let uid else { return nil }
+        return uid.takeRetainedValue() as String
+    }
+
+    /// A second sound output that plays through `device`: making it the default is a real change of output device.
+    static func createAggregate(playingThrough device: AudioDeviceID) -> AudioDeviceID? {
+        guard let uid = deviceUID(device) else { return nil }
+        let description: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "SameSofa test output",
+            kAudioAggregateDeviceUIDKey: "samesofa-test-output-\(getpid())",
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: uid]],
+            kAudioAggregateDeviceMasterSubDeviceKey: uid,
+            kAudioAggregateDeviceIsPrivateKey: 0,
+            kAudioAggregateDeviceIsStackedKey: 0,
+        ]
+        var aggregate = AudioDeviceID(0)
+        guard AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregate) == noErr, aggregate != 0 else { return nil }
+        return aggregate
+    }
+
+    static var cleanup: (() -> Void)?
+
+    static func runEngineTest(film: URL?, realSwitch: Bool) -> Never {
+        let hub = AudioHub(mode: .live)
+        hub.voiceVolume = 0
+        hub.filmVolume = 0
+        let call = FakeCall()
+        call.silent = true
+        _ = hub.initialize(with: call)
+        hub.setCallStateForTesting(playing: true, recording: true)
+        hub.start()
+        spin(1.5)
+        var diagnostics = hub.diagnostics()
+        check("the call's audio engine runs (zero volume)", diagnostics.engineRunning && hub.engineError == nil, hub.engineError ?? "microphone: \(hub.microphoneState)")
+        var rendered = diagnostics.renderCallbacks
+        spin(0.5)
+        check("the output is calling back", hub.diagnostics().renderCallbacks > rendered)
+
+        // 1.2.0 tried a restart once. A device that is still settling makes that one attempt fail.
+        hub.supervisionForTesting = false
+        hub.failStartsForTesting = 1
+        hub.simulateDeviceChange()
+        spin(3)
+        check("as in 1.2.0 (no supervision): one failed restart leaves the call's audio down", !hub.diagnostics().engineRunning && hub.engineError != nil)
+        hub.supervisionForTesting = true
+        check("supervision brings it back", waitUntil(3) { hub.diagnostics().engineRunning } && hub.engineError == nil && hub.engineRecoveries >= 1,
+              "\(hub.engineRecoveries) recoveries")
+        hub.failStartsForTesting = 3
+        let began = Date()
+        hub.simulateDeviceChange()
+        check("three failed restarts in a row: running again", waitUntil(6) { hub.diagnostics().engineRunning } && hub.engineError == nil,
+              String(format: "after %.1f s", Date().timeIntervalSince(began)))
+        rendered = hub.diagnostics().renderCallbacks
+        spin(0.5)
+        check("the output is calling back again", hub.diagnostics().renderCallbacks > rendered)
+
+        guard let film else { hub.stop(); finish("audio engine") }
+
+        // A film playing (muted) next to the call: its echo reference.
+        let playback = PlaybackController(role: .host, hub: hub)
+        playback.player.isMuted = true
+        let tapFrames = OSAllocatedUnfairLock(initialState: 0)
+        playback.filmAudioMonitor = { _, frames, _, _ in tapFrames.withLock { $0 += frames } }
+        playback.load(asset: AVURLAsset(url: film))
+        guard waitUntil(15, { playback.isLoaded }) else { check("film loads", false); hub.stop(); finish("audio engine") }
+        playback.play()
+        /// Polls the echo reference as the microphone thread would, every 10 ms; returns its energy.
+        func listen(_ seconds: Double) -> Double {
+            var energy = 0.0
+            let end = Date().addingTimeInterval(seconds)
+            while Date() < end {
+                let reference = hub.referenceForTesting(atHostTime: AudioHub.hostClockNow)
+                for sample in reference.left { energy += Double(sample * sample) }
+                spin(0.01)
+            }
+            return energy
+        }
+        hub.filmVolume = 1 // scales the reference only; the player stays muted
+        _ = listen(1.5)
+        let playing = listen(2)
+        check("film plays and its sound reaches the echo reference", playback.player.rate == 1 && tapFrames.withLock { $0 } > 48_000 && playing > 0 && hub.cancelsFilmEcho,
+              "output: \(hub.outputRoute.transport.rawValue) -> \(hub.outputRoute.kind.rawValue), trim \(Int(hub.filmReferenceTrim * 1000)) ms")
+        for index in 0..<6 {
+            playback.seek(to: Double(5 + index * 7).truncatingRemainder(dividingBy: max(10, playback.duration - 10)))
+            _ = listen(1.2)
+        }
+        let afterSeeks = listen(1.5)
+        check("after six seeks the reference is never read later than the film's clock", hub.filmReferenceTrim <= 0.0401 && afterSeeks > 0,
+              "trim \(Int(hub.filmReferenceTrim * 1000)) ms (lead 40 ms; 1.2.0 let it grow to 200), asked for sound not yet arrived \(hub.filmReferenceLate) times")
+
+        if realSwitch {
+            guard let original = AudioDevices.defaultOutput(), let aggregate = createAggregate(playingThrough: original.id) else {
+                check("a second output device for the test", false)
+                hub.stop()
+                finish("audio engine")
+            }
+            cleanup = {
+                AudioDevices.setDefault(original.id, input: false)
+                AudioHardwareDestroyAggregateDevice(aggregate)
+            }
+            atexit { AudioThreadTests.cleanup?() }
+            for sig in [SIGINT, SIGTERM, SIGHUP] { signal(sig) { _ in AudioThreadTests.cleanup?(); _exit(1) } }
+            print("INFO default output before: id \(original.id) (\(original.summary))")
+            func survives(_ what: String) {
+                let restarts = hub.engineRestarts, position = playback.currentTime
+                let tapBefore = tapFrames.withLock { $0 }
+                _ = listen(2)
+                let renderedBefore = hub.diagnostics().renderCallbacks, tapMiddle = tapFrames.withLock { $0 }
+                let energy = listen(2)
+                let d = hub.diagnostics()
+                check("\(what): the call's audio engine was rebuilt and runs", d.engineRunning && hub.engineError == nil && d.renderCallbacks > renderedBefore,
+                      "\(hub.engineRestarts - restarts) rebuild(s)")
+                check("\(what): the film plays on with sound", playback.player.rate == 1 && playback.currentTime - position > 3
+                        && tapFrames.withLock { $0 } - tapMiddle > 48_000 && energy > 0,
+                      String(format: "%.1f s of film in 4 s, %d frames of sound in the last 2 s (%d in the first 2 s)", playback.currentTime - position,
+                             tapFrames.withLock { $0 } - tapMiddle, tapMiddle - tapBefore))
+            }
+            let switched = AudioDevices.setDefault(aggregate, input: false)
+            check("the default sound output really changed", switched && waitUntil(2) { AudioDevices.defaultOutput()?.id == aggregate })
+            print("INFO default output during: id \(aggregate) (\(AudioDevices.defaultOutput()?.summary ?? "?"))")
+            survives("output device changed mid-film")
+            AudioDevices.setDefault(original.id, input: false)
+            waitUntil(2) { AudioDevices.defaultOutput()?.id == original.id }
+            survives("output device changed back")
+            // The device itself disappears (headphones unplugged).
+            AudioHardwareDestroyAggregateDevice(aggregate)
+            cleanup = nil
+            survives("the other device removed")
+            let final = AudioDevices.defaultOutput()
+            print("INFO default output after: id \(final?.id ?? 0) (\(final?.summary ?? "?"))")
+            check("the default output is the original one again", final?.id == original.id)
+        }
+        playback.pause()
+        playback.unload()
+        hub.stop()
+        finish("audio engine")
     }
 
     final class AtomicFlag: @unchecked Sendable {

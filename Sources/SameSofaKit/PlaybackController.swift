@@ -30,7 +30,7 @@ public final class PlaybackController: ObservableObject {
     public var filmAudioMonitor: FilmAudioMonitor?
     /// How often the playback speed was nudged to stay in sync (diagnostics).
     public private(set) var nudgeCount = 0
-    private var nudging = false
+    private var nudge = NudgeState()
     /// The film's frame rate (0 if unknown), for matching the display to it.
     @Published public private(set) var frameRate = 0.0
     /// Let the system apply spatial audio (Dolby Atmos, AirPods) instead of
@@ -101,6 +101,8 @@ public final class PlaybackController: ObservableObject {
     // MARK: Loading
 
     public func load(asset: AVURLAsset) {
+        // A film already in the player stops here, not when the new one happens to be ready.
+        if player.currentItem != nil { unload() }
         isLoaded = false
         loadGeneration += 1
         let generation = loadGeneration
@@ -162,7 +164,8 @@ public final class PlaybackController: ObservableObject {
                 self.quality = quality
                 self.frameRate = frameRate
                 self.observers = [item.observe(\.status) { [weak self] item, _ in
-                    DispatchQueue.main.async { if item.status == .readyToPlay { self?.isLoaded = true; self?.apply() } }
+                    // Only for the item the player holds now: a film replaced or unloaded in the meantime must not count as loaded.
+                    DispatchQueue.main.async { if item.status == .readyToPlay, self?.player.currentItem === item { self?.isLoaded = true; self?.apply() } }
                 }]
                 self.player.replaceCurrentItem(with: item)
             }
@@ -281,6 +284,8 @@ public final class PlaybackController: ObservableObject {
     func apply() {
         publishState()
         guard player.currentItem != nil else { return }
+        // Whatever follows sets the player's speed itself: a nudge under way is over.
+        nudge.reset()
         let now = sharedNow
         let target = engine.targetPosition(at: now)
         Log.debug("\(engine.role) apply playing=\(engine.timeline.playing) effective=\(engine.effectivePlaying) held=\(engine.isHeld) target=\(String(format: "%.2f", target)) actual=\(String(format: "%.2f", currentTime)) anchorIn=\(String(format: "%.2f", engine.timeline.anchor - now))")
@@ -310,6 +315,7 @@ public final class PlaybackController: ObservableObject {
         let timeline = engine.timeline
         let startShared = startLocal + clockOffset
         let position = engine.targetPosition(at: startShared)
+        nudge.reset()
         setRate(0)
         pendingStartUntil = startLocal + 0.4
         let began = localNow()
@@ -364,9 +370,9 @@ public final class PlaybackController: ObservableObject {
         // Drift correction, at most every half second and not mid-seek/start.
         guard !seeking, local > pendingStartUntil, local - lastCorrectionAt >= 0.5 else { return }
         lastCorrectionAt = local
-        switch engine.correction(actualPosition: actual, now: now, nudging: nudging) {
+        switch engine.correction(actualPosition: actual, now: now, nudging: nudge.isNudging) {
         case .none(let rate):
-            nudging = false
+            nudge.reset()
             hostSlipTicks = 0
             setRate(Float(rate))
         case .adjustRate(let rate):
@@ -380,16 +386,15 @@ public final class PlaybackController: ObservableObject {
                     reanchorCount += 1
                     send?(.timeline(engine.reanchor(now: now, actualPosition: actual)))
                 }
-            } else if !nudging || (rate > 1) != (player.rate > 1) {
+            } else if let speed = nudge.adjust(to: rate) {
                 // One speed for the whole correction, chosen at its start and
                 // held until the gap is closed: every change of speed is a
                 // small disturbance in itself.
                 nudgeCount += 1
-                nudging = true
-                setRate(Float(rate))
+                setRate(Float(speed))
             }
         case .seek(let target):
-            nudging = false
+            nudge.reset()
             hostSlipTicks = 0
             guard local - lastSeekAt > 1.5 else { return }
             if engine.effectivePlaying {
