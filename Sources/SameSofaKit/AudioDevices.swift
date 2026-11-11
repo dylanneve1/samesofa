@@ -56,51 +56,140 @@ private func fourCharacters(_ code: UInt32) -> String {
     return String(bytes: bytes, encoding: .ascii) ?? ""
 }
 
+private func transportKind(_ raw: UInt32) -> OutputRoute.Transport {
+    switch raw {
+    case kAudioDeviceTransportTypeBuiltIn: return .builtIn
+    case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: return .bluetooth
+    case kAudioDeviceTransportTypeUSB: return .usb
+    case kAudioDeviceTransportTypeHDMI: return .hdmi
+    case kAudioDeviceTransportTypeDisplayPort: return .displayPort
+    case kAudioDeviceTransportTypeAirPlay: return .airPlay
+    case kAudioDeviceTransportTypeThunderbolt: return .thunderbolt
+    case kAudioDeviceTransportTypeVirtual: return .virtual
+    case kAudioDeviceTransportTypeAggregate: return .aggregate
+    default: return .other
+    }
+}
+
 /// The Mac's current sound output.
 public enum OutputDevice {
     public static func currentRoute() -> OutputRoute {
         guard let device = AudioObject.defaultDevice(kAudioHardwarePropertyDefaultOutputDevice) else { return .unknown }
-        let transport: OutputRoute.Transport
-        switch AudioObject.transport(device) {
-        case kAudioDeviceTransportTypeBuiltIn: transport = .builtIn
-        case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: transport = .bluetooth
-        case kAudioDeviceTransportTypeUSB: transport = .usb
-        case kAudioDeviceTransportTypeHDMI: transport = .hdmi
-        case kAudioDeviceTransportTypeDisplayPort: transport = .displayPort
-        case kAudioDeviceTransportTypeAirPlay: transport = .airPlay
-        case kAudioDeviceTransportTypeThunderbolt: transport = .thunderbolt
-        case kAudioDeviceTransportTypeVirtual: transport = .virtual
-        case kAudioDeviceTransportTypeAggregate: transport = .aggregate
-        default: transport = .other
-        }
         let source = AudioObject.value(device, kAudioDevicePropertyDataSource, scope: kAudioDevicePropertyScopeOutput, default: UInt32(0))
         return OutputRoute(name: AudioObject.name(device) ?? "Unknown output",
-                           transport: transport,
+                           transport: transportKind(AudioObject.transport(device)),
                            dataSource: source.map(fourCharacters),
                            hasInput: AudioObject.streamCount(device, scope: kAudioDevicePropertyScopeInput) > 0)
     }
 }
 
-enum InputDevice {
-    /// Using a Bluetooth headset's own microphone switches the headset to its
-    /// telephone mode, and the film then plays in telephone quality. If the
-    /// default microphone is a Bluetooth one and the Mac has a built-in
-    /// microphone, record from the built-in one instead.
-    static func preferBuiltInOverBluetooth(for input: AVAudioInputNode) {
-        guard let current = AudioObject.defaultDevice(kAudioHardwarePropertyDefaultInputDevice) else { return }
-        let transport = AudioObject.transport(current)
-        guard transport == kAudioDeviceTransportTypeBluetooth || transport == kAudioDeviceTransportTypeBluetoothLE else { return }
-        guard var builtIn = AudioObject.allDevices().first(where: {
-            AudioObject.transport($0) == kAudioDeviceTransportTypeBuiltIn
-                && AudioObject.streamCount($0, scope: kAudioDevicePropertyScopeInput) > 0
-        }), let unit = input.audioUnit else { return }
-        let status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
-                                          &builtIn, UInt32(MemoryLayout<AudioDeviceID>.size))
-        if status == noErr {
-            NSLog("SameSofa: using the built-in microphone so the Bluetooth headphones stay in high quality")
-        } else {
-            NSLog("SameSofa: could not select the built-in microphone (\(status)); using the default one")
+/// One sound device as Core Audio describes it, for one direction.
+public struct AudioDeviceInfo: Equatable, Sendable {
+    public var id: UInt32
+    public var name: String
+    public var transport: OutputRoute.Transport
+    /// Nominal sample rate (0 when the device does not say).
+    public var sampleRate: Double
+    /// Channels in this direction.
+    public var channels: Int
+
+    /// "built-in, 48000 Hz, 3 channels": no device names (they can contain a person's name).
+    public var summary: String {
+        "\(transport.rawValue), \(Int(sampleRate)) Hz, \(channels) channel\(channels == 1 ? "" : "s")"
+    }
+}
+
+/// The sound devices the call's audio depends on.
+public enum AudioDevices {
+    static func channelCount(_ device: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr, size >= UInt32(MemoryLayout<AudioBufferList>.size) else { return 0 }
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { raw.deallocate() }
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, raw) == noErr else { return 0 }
+        let list = UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self))
+        return list.reduce(0) { $0 + Int($1.mNumberChannels) }
+    }
+
+    static func info(_ device: AudioDeviceID, scope: AudioObjectPropertyScope) -> AudioDeviceInfo {
+        AudioDeviceInfo(id: device, name: AudioObject.name(device) ?? "Unknown device", transport: transportKind(AudioObject.transport(device)),
+                        sampleRate: AudioObject.value(device, kAudioDevicePropertyNominalSampleRate, default: Float64(0)) ?? 0,
+                        channels: channelCount(device, scope: scope))
+    }
+
+    public static func defaultOutput() -> AudioDeviceInfo? {
+        AudioObject.defaultDevice(kAudioHardwarePropertyDefaultOutputDevice).map { info($0, scope: kAudioDevicePropertyScopeOutput) }
+    }
+
+    public static func defaultInput() -> AudioDeviceInfo? {
+        AudioObject.defaultDevice(kAudioHardwarePropertyDefaultInputDevice).map { info($0, scope: kAudioDevicePropertyScopeInput) }
+    }
+
+    /// Every device that can record.
+    public static func inputs() -> [AudioDeviceInfo] {
+        AudioObject.allDevices().filter { AudioObject.streamCount($0, scope: kAudioDevicePropertyScopeInput) > 0 }
+            .map { info($0, scope: kAudioDevicePropertyScopeInput) }.filter { $0.channels > 0 }
+    }
+
+    public static func outputs() -> [AudioDeviceInfo] {
+        AudioObject.allDevices().filter { AudioObject.streamCount($0, scope: kAudioDevicePropertyScopeOutput) > 0 }
+            .map { info($0, scope: kAudioDevicePropertyScopeOutput) }.filter { $0.channels > 0 }
+    }
+
+    /// The microphone a call records from: the default one, except that a
+    /// Bluetooth headset's microphone is passed over for a built-in one.
+    /// Using the headset's own microphone switches it to its telephone
+    /// mode, and the film then plays in telephone quality.
+    public static func preferredInput() -> AudioDeviceInfo? {
+        guard let current = defaultInput() else { return nil }
+        guard current.transport == .bluetooth else { return current }
+        return inputs().first { $0.transport == .builtIn } ?? current
+    }
+
+    /// Makes `device` the system's default microphone or sound output (tests only).
+    @discardableResult
+    public static func setDefault(_ device: UInt32, input: Bool) -> Bool {
+        var address = AudioObjectPropertyAddress(mSelector: input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var value = device
+        return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &value) == noErr
+    }
+}
+
+/// The devices (and the microphone's format) an audio engine was built
+/// for. When this changes the engine has to be built again.
+struct AudioDeviceSignature: Equatable {
+    var output: AudioDeviceID?
+    var input: AudioDeviceID?
+    var inputRate = 0.0
+    var inputChannels = 0
+
+    static func current(pinnedInput: AudioDeviceID? = nil) -> AudioDeviceSignature {
+        var signature = AudioDeviceSignature(output: AudioObject.defaultDevice(kAudioHardwarePropertyDefaultOutputDevice))
+        let input = pinnedInput.map { AudioDevices.info($0, scope: kAudioDevicePropertyScopeInput) } ?? AudioDevices.preferredInput()
+        if let input, input.channels > 0 {
+            signature.input = input.id
+            signature.inputRate = input.sampleRate
+            signature.inputChannels = input.channels
         }
+        return signature
+    }
+}
+
+enum InputDevice {
+    /// Makes the engine's input record from `device` when that is not the
+    /// default microphone (see `AudioDevices.preferredInput`). Returns false
+    /// when the device could not be selected (the default one is used then).
+    @discardableResult
+    static func select(_ device: AudioDeviceID, for input: AVAudioInputNode) -> Bool {
+        guard device != AudioObject.defaultDevice(kAudioHardwarePropertyDefaultInputDevice) else { return true }
+        guard let unit = input.audioUnit else { return false }
+        var wanted = device
+        let status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                          &wanted, UInt32(MemoryLayout<AudioDeviceID>.size))
+        if status != noErr { NSLog("SameSofa: could not select the microphone (\(status)); using the default one") }
+        return status == noErr
     }
 
     /// Name of the default microphone, for the quality readout.

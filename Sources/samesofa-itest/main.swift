@@ -32,6 +32,8 @@ if args["audio-check"] != nil {
     hub.stop()
     exit(0)
 }
+// The call's audio threads and the microphone converter, without any hardware.
+if args["audio-thread-test"] != nil { AudioThreadTests.runThreadTest() }
 // Film sound path measurements and the echo canceller simulation (no sound is played).
 if let list = args["audio-measure"] {
     FilmPathMeasure.run(files: list.split(separator: ",").map { URL(fileURLWithPath: String($0)) }, referenceFFmpeg: args["reference-ffmpeg"],

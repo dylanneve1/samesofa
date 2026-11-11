@@ -60,7 +60,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "samesofa-itest",
-            dependencies: ["SameSofaKit", "SameSofaCore", "CEchoCanceller", "WebRTC"]
+            dependencies: ["SameSofaKit", "SameSofaCore", "CEchoCanceller", "CWebRTCAudioDevice", "WebRTC"]
         ),
         .testTarget(name: "SameSofaCoreTests", dependencies: ["SameSofaCore"]),
     ],
