@@ -115,6 +115,7 @@ struct PartyView: View {
                 StatusCard {
                     Text("Getting the film ready").font(.title2)
                     ProgressView(value: party.transferFraction).frame(width: 260).tint(Theme.accent)
+                    if !party.transferLine.isEmpty { Text(party.transferLine).font(.callout).foregroundStyle(.secondary) }
                 }
             } else if playback.isHeld {
                 StatusCard {
@@ -152,8 +153,8 @@ struct PartyView: View {
                 .shadow(radius: 4)
             Spacer()
             if case .waitingForPartner(let code) = party.phase { CodeChip(code: code) }
-            if party.phase == .together, party.role == .host, party.preparing == nil, party.transferFraction < 1 {
-                Text("Sending the film: \(Int(party.transferFraction * 100))%")
+            if party.phase == .together, party.preparing == nil, party.transferFraction < 1, let film = party.sharedFilm {
+                Text(party.transferLine.isEmpty ? TransferText.line(sending: party.role == .host, received: 0, total: film.size, rate: 0) : party.transferLine)
                     .font(.callout).foregroundStyle(.white.opacity(0.75))
                     .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(Capsule().fill(.black.opacity(0.45)))

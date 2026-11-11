@@ -266,4 +266,12 @@ final class SyncTests: XCTestCase {
         s.prioritize(offset: 910 * 65536, length: 65536)
         XCTAssertFalse(s.urgentIsJump)
     }
+
+    func testTransferText() {
+        XCTAssertEqual(TransferText.line(sending: true, received: 126_000_000, total: 2_100_000_000, rate: 5_200_000),
+                       "Sending the film: 126 MB of 2.1 GB · 5.2 MB/s · 6.0%")
+        XCTAssertEqual(TransferText.line(sending: false, received: 0, total: 2_100_000_000, rate: 0),
+                       "Receiving the film: 0 B of 2.1 GB · 0.0%")
+        XCTAssertEqual(TransferText.percent(0.5), "50%")
+    }
 }

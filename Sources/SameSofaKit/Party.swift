@@ -61,7 +61,30 @@ public final class Party: ObservableObject {
     @Published public private(set) var localVideoTrack: RTCVideoTrack?
     @Published public private(set) var filmName: String?
     /// Guest: share of the film received. Host: what the guest reported.
-    @Published public private(set) var transferFraction: Double = 0
+    @Published public private(set) var transferFraction: Double = 0 {
+        didSet { noteTransfer(transferFraction) }
+    }
+    /// "Sending the film: 126 MB of 2.1 GB · 5.2 MB/s", empty when nothing is moving.
+    @Published public private(set) var transferLine = ""
+    private var rateMark: (time: Date, bytes: Double)?
+    private var smoothedRate: Double = 0
+
+    private func noteTransfer(_ fraction: Double) {
+        guard let info = sharedFilm, info.size > 0 else { return }
+        let bytes = fraction * Double(info.size)
+        let now = Date()
+        if let mark = rateMark {
+            let dt = now.timeIntervalSince(mark.time)
+            if dt >= 1 {
+                let instant = max(0, bytes - mark.bytes) / dt
+                smoothedRate = smoothedRate == 0 ? instant : smoothedRate * 0.6 + instant * 0.4
+                rateMark = (now, bytes)
+            }
+        } else {
+            rateMark = (now, bytes)
+        }
+        transferLine = fraction >= 1 ? "" : TransferText.line(sending: role == .host, received: Int64(bytes), total: info.size, rate: smoothedRate)
+    }
     /// Host: the film is being converted to MP4 before it can be shared.
     /// Guest: the host said so. nil when nothing is being prepared.
     @Published public private(set) var preparing: Preparing?
@@ -212,6 +235,7 @@ public final class Party: ObservableObject {
         hub.stop()
         receiver = nil
         sharedFilm = nil
+        transferLine = ""; rateMark = nil; smoothedRate = 0
         sender?.detach()
         if let sender, sender.url.path.hasPrefix(FilmPreparer.directory.path) {
             try? FileManager.default.removeItem(at: sender.url)
@@ -391,7 +415,6 @@ public final class Party: ObservableObject {
                 let offset = Int64(seconds * bytesPerSecond)
                 receiver.setPlayhead(offset: offset)
                 let needed = min(Double(info.size - offset), bytesPerSecond * 8)
-                if receiver.contiguousBytes(from: offset) == 0 { receiver.prioritize(offset: offset, length: Int64(needed)) }
                 return Double(receiver.contiguousBytes(from: offset)) >= needed
             }
             playback.load(asset: asset)
