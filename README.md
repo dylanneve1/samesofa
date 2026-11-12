@@ -782,6 +782,14 @@ scripts/                  build.sh, fetch-webrtc.sh, build-apm.sh, build-ffmpeg.
   window shows "Getting the film ready" until the host picks one) and cannot
   follow a change of film: the host is told so, and the film buttons are
   switched off once that partner has a film.
+- The audio engine test that really changes the default sound output
+  (`--audio-engine-test … --real-output-switch 1`) fails now and then on the
+  build machine, with 1.2.1 as with 1.3: the player sometimes stalls for a
+  few tenths of a second at the change, and in about one run in ten the copy
+  of the film's sound kept for the echo canceller is then silent for at least
+  two seconds although the film's clock and the copy's position are right.
+  Whether the player itself is silent in that moment (then there is nothing
+  to cancel) could not be established without a microphone.
 - Reconnecting, the output-device change and the microphone path were tested
   on one Mac without a microphone (simulated drops, a stand-in second output
   device, synthetic microphone formats). Run `samesofa-itest --device-smoke 1`

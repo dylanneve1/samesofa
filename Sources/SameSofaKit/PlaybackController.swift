@@ -50,6 +50,16 @@ public final class PlaybackController: ObservableObject {
     private var listening: (() -> AVAudioMix?)?
     private var hostSlipTicks = 0
 
+    /// The clock the call's echo canceller reads the film's position from (nil: the film is not listened to).
+    private var filmClock: CMTimebase?
+    /// How often the player gave the film a new clock in mid-film and the canceller was told (diagnostics, tests).
+    public private(set) var filmClockChanges = 0
+
+    private func setFilmClock(_ timebase: CMTimebase?) {
+        filmClock = timebase
+        hub.setFilmTimebase(timebase)
+    }
+
     private func setRate(_ rate: Float) {
         guard player.rate != rate else { return }
         player.rate = rate
@@ -134,7 +144,7 @@ public final class PlaybackController: ObservableObject {
                 if self.systemSpatialAudio {
                     // The system decides (Dolby Atmos, spatial audio with AirPods...).
                     // Nothing listens in, so the film cannot be removed from the microphone.
-                    self.hub.setFilmTimebase(nil)
+                    self.setFilmClock(nil)
                 } else {
                     // A plain stereo or multichannel signal, folded down by the
                     // system when the output has fewer channels.
@@ -150,9 +160,9 @@ public final class PlaybackController: ObservableObject {
                     if self.hub.wantsFilmReference, let mix = self.listening?() {
                         item.audioMix = mix
                         self.listening = nil
-                        self.hub.setFilmTimebase(item.timebase)
+                        self.setFilmClock(item.timebase)
                     } else {
-                        self.hub.setFilmTimebase(nil)
+                        self.setFilmClock(nil)
                     }
                 }
                 self.audioSetupCount += 1
@@ -182,7 +192,7 @@ public final class PlaybackController: ObservableObject {
         listening = nil
         item.audioMix = mix
         audioSetupCount += 1
-        hub.setFilmTimebase(item.timebase)
+        setFilmClock(item.timebase)
     }
 
     /// Shows or hides the film's subtitles (each side chooses for itself).
@@ -206,7 +216,7 @@ public final class PlaybackController: ObservableObject {
         listening = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
-        hub.setFilmTimebase(nil)
+        setFilmClock(nil)
         frameRate = 0
         quality = PlaybackQuality()
         observers = []
@@ -426,6 +436,15 @@ public final class PlaybackController: ObservableObject {
         let actual = currentTime
         if !seeking { position = actual }
         guard player.currentItem != nil else { return }
+
+        // When the sound output changes, the player may rebuild its pipeline and give the item a
+        // new clock; the old one then stands still. The echo canceller must follow, or it would
+        // stop hearing the film for the rest of it.
+        if let known = filmClock, let current = player.currentItem?.timebase, current !== known {
+            filmClockChanges += 1
+            Log.debug("\(engine.role) the film has a new clock; telling the echo canceller")
+            setFilmClock(current)
+        }
 
         // The end of the film: the host stops the timeline there (for both), instead of
         // both players standing at the end of a film that is still "playing".

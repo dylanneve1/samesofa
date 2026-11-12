@@ -51,6 +51,11 @@ final class TimedRing {
         lock.withLock { count = 0; hasAnchor = false }
     }
 
+    /// What the ring holds: how many frames, from which position up to (not including) which.
+    var span: (count: Int, first: Int64, end: Int64) {
+        lock.withLock { (count, end - Int64(count), end) }
+    }
+
     /// Appends `frames` frames. `position` is where the first one sits on the
     /// timeline (nil: right after the previous ones); a gap or a step back
     /// drops what was there. `hostTime` is when the first frame is played,
@@ -638,6 +643,15 @@ public final class AudioHub: NSObject, RTCAudioDevice {
             }
         }
         return (left, right, filmTime)
+    }
+    /// Where the film's echo reference stands (diagnostics): what the ring holds and where the film's clock is.
+    public func filmReferenceDescription() -> String {
+        let (timebase, rate) = filmClockLock.withLock { (filmTimebase, filmRate) }
+        let held = filmReference.span
+        guard let timebase else { return "no film clock; ring holds \(held.count) frames" }
+        let media = CMTimebaseGetTime(timebase).seconds, speed = CMTimebaseGetRate(timebase)
+        return String(format: "film clock at %.3f s, speed %.2f, sample rate %.0f; ring holds %d frames, %.3f to %.3f s; level of the film's sound as the player hands it over %.4f",
+                      media, speed, rate, held.count, Double(held.first) / max(1, rate), Double(held.end) / max(1, rate), filmLevel)
     }
     /// Host clock in seconds, as used for `referenceForTesting`.
     public static var hostClockNow: Double { HostClock.now }

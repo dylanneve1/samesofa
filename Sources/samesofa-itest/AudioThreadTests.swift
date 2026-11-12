@@ -383,9 +383,14 @@ enum AudioThreadTests {
                 let renderedBefore = hub.diagnostics().renderCallbacks, tapMiddle = tapFrames.withLock { $0 }
                 let energy = listen(2)
                 let d = hub.diagnostics()
+                if energy <= 0 {
+                    print("INFO no film sound in the echo reference: output \(hub.outputRoute.name) [\(hub.outputRoute.transport.rawValue)] -> \(hub.outputRoute.kind.rawValue), cancels film echo \(hub.cancelsFilmEcho), wants reference \(hub.wantsFilmReference), film clock changes \(playback.filmClockChanges), late \(hub.filmReferenceLate), trim \(Int(hub.filmReferenceTrim * 1000)) ms, engine running \(d.engineRunning), error \(hub.engineError ?? "none"); \(hub.filmReferenceDescription()); player at \(playback.currentTime) s rate \(playback.player.rate)")
+                }
                 check("\(what): the call's audio engine runs", d.engineRunning && hub.engineError == nil && d.renderCallbacks > renderedBefore
                         && (!mustRebuild || hub.engineRestarts > restarts), "rebuilt \(hub.engineRestarts - restarts) time(s)")
-                check("\(what): the film plays on with sound", playback.player.rate == 1 && playback.currentTime - position > 3
+                // (A real change of device can stall the player for a few tenths of a second; the sync engine then
+                // brings it back with a short stop and start. The film must be running again, not running at this very instant.)
+                check("\(what): the film plays on with sound", waitUntil(2) { playback.player.rate == 1 } && playback.currentTime - position > 3
                         && tapFrames.withLock { $0 } - tapMiddle > 48_000 && energy > 0,
                       String(format: "%.1f s of film in 4 s, %d frames of sound in the last 2 s (%d in the first 2 s)", playback.currentTime - position,
                              tapFrames.withLock { $0 } - tapMiddle, tapMiddle - tapBefore))
@@ -401,6 +406,7 @@ enum AudioThreadTests {
             AudioHardwareDestroyAggregateDevice(aggregate)
             cleanup = nil
             survives("the other device removed", mustRebuild: false)
+            print("INFO the player gave the film a new clock \(playback.filmClockChanges) time(s) during the device changes")
             let final = AudioDevices.defaultOutput()
             print("INFO default output after: id \(final?.id ?? 0) (\(final?.summary ?? "?"))")
             check("the default output is the original one again", final?.id == original.id)
